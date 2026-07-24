@@ -88,85 +88,49 @@ export async function seedDatabase() {
   console.log('✅ Products seeded: Гаражна Врата, Прозорски Систем, Ролетна');
 
   // 3. Seed Models & Spec Keys for Garage Door
-  const modelG1 = await prisma.productModel.create({
-    data: {
-      productId: garageDoor.id,
-      name: 'ThermoPro 40 (40мм Изолација)',
-      basePrice: 850.00,
-    },
+  let modelG1 = await prisma.productModel.findFirst({
+    where: { productId: garageDoor.id, name: 'ThermoPro 40 (40мм Изолација)' },
   });
-
-  const modelG2 = await prisma.productModel.create({
-    data: {
-      productId: garageDoor.id,
-      name: 'UltraShield 60 (60мм Изолација)',
-      basePrice: 1200.00,
-    },
-  });
-
-  // Specs for Garage Door
-  await prisma.specificationKey.create({
-    data: {
-      productId: garageDoor.id,
-      name: 'Површина и Завршница на Панел',
-      inputType: 'SELECT',
-      options: {
-        create: [
-          { label: 'Стуко Втиснат (Стандардна Бела)', priceModifier: 0.00 },
-          { label: 'Мазна Мат - RAL 7016 Антрацит', priceModifier: 85.00 },
-          { label: 'Златен Даб Дрвен Декор', priceModifier: 150.00 },
-        ],
+  if (!modelG1) {
+    modelG1 = await prisma.productModel.create({
+      data: {
+        productId: garageDoor.id,
+        name: 'ThermoPro 40 (40мм Изолација)',
+        basePrice: 850.00,
       },
-    },
-  });
-
-  await prisma.specificationKey.create({
-    data: {
-      productId: garageDoor.id,
-      name: 'Автоматизиран Мотор и Погон',
-      inputType: 'SELECT',
-      options: {
-        create: [
-          { label: 'Рачно Управување (Со синџир и брава)', priceModifier: 0.00 },
-          { label: 'Somfy Dexxo Optimo Паметен Мотор (+2 далечински)', priceModifier: 240.00 },
-          { label: 'Hörmann SupraMatic E Брз Погон', priceModifier: 380.00 },
-        ],
-      },
-    },
-  });
+    });
+  }
 
   // 4. Seed Customers
-  const customerCorp = await prisma.customer.create({
-    data: {
-      customerType: 'COMPANY',
-      name: 'Логистички Центар Скопје ДООЕЛ',
-      companyName: 'Логистички Центар Скопје ДООЕЛ',
-      taxId: 'MK4030012345678',
-      email: 'nabavki@logistika.mk',
-      phone: '+389 2 3123 456',
-      address: 'Ул. Индустриска бр. 42',
-      city: 'Скопје',
-      notes: 'Главен комерцијален клиент. Стандардно фактурирање со 18% ДДВ.',
-    },
+  let customerCorp = await prisma.customer.findFirst({
+    where: { taxId: 'MK4030012345678' },
   });
-
-  await prisma.customer.create({
-    data: {
-      customerType: 'INDIVIDUAL',
-      name: 'Александар Стојановски',
-      email: 'alex.stojanovski@gmail.com',
-      phone: '+389 70 888 999',
-      address: 'Ул. Партизански Одреди 74',
-      city: 'Скопје',
-      notes: 'Реновирање на приватна вила.',
-    },
-  });
+  if (!customerCorp) {
+    customerCorp = await prisma.customer.create({
+      data: {
+        customerType: 'COMPANY',
+        name: 'Логистички Центар Скопје ДООЕЛ',
+        companyName: 'Логистички Центар Скопје ДООЕЛ',
+        taxId: 'MK4030012345678',
+        email: 'nabavki@logistika.mk',
+        phone: '+389 2 3123 456',
+        address: 'Ул. Индустриска бр. 42',
+        city: 'Скопје',
+        notes: 'Главен комерцијален клиент. Стандардно фактурирање со 18% ДДВ.',
+      },
+    });
+  }
 
   console.log('✅ Customers seeded in Macedonian');
 
-  // 5. Seed Sample Offer
-  const sampleOffer = await prisma.offer.create({
-    data: {
+  // 5. Seed Sample Offer (Idempotent Upsert)
+  const sampleOffer = await prisma.offer.upsert({
+    where: { offerNumber: 'OFF-2026-0001' },
+    update: {
+      createdByUserId: superAdmin.id,
+      customerId: customerCorp.id,
+    },
+    create: {
       offerNumber: 'OFF-2026-0001',
       customerId: customerCorp.id,
       createdByUserId: superAdmin.id,
@@ -201,7 +165,7 @@ export async function seedDatabase() {
     },
   });
 
-  console.log(`✅ Sample Offer Created: ${sampleOffer.offerNumber}`);
+  console.log(`✅ Sample Offer Created/Updated: ${sampleOffer.offerNumber}`);
   console.log('🎉 Seeding finished successfully!');
 }
 

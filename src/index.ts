@@ -84,8 +84,10 @@ app.post('/api/profiles', async (req, res) => {
   try {
     const { email, fullName, role, password } = req.body;
     const passwordHash = password ? bcrypt.hashSync(password, 10) : bcrypt.hashSync('IMFEX2026!', 10);
-    const profile = await prisma.profile.create({
-      data: {
+    const profile = await prisma.profile.upsert({
+      where: { email: email.toLowerCase() },
+      update: { fullName, role, status: 'ACTIVE' },
+      create: {
         email: email.toLowerCase(),
         fullName,
         role: role || 'USER',
@@ -100,7 +102,7 @@ app.post('/api/profiles', async (req, res) => {
   }
 });
 
-// Products API
+// Products API (Idempotent Upsert & Specs Support)
 app.get('/api/products', async (req, res) => {
   try {
     const products = await prisma.product.findMany({
@@ -121,11 +123,95 @@ app.get('/api/products', async (req, res) => {
 
 app.post('/api/products', async (req, res) => {
   try {
-    const { name, code, description, isActive } = req.body;
-    const product = await prisma.product.create({
-      data: { name, code, description, isActive: isActive ?? true },
+    const { name, code, description, isActive, models, specificationKeys } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Product code is required' });
+    }
+
+    const product = await prisma.product.upsert({
+      where: { code },
+      update: {
+        name,
+        description,
+        isActive: isActive ?? true,
+      },
+      create: {
+        name,
+        code,
+        description,
+        isActive: isActive ?? true,
+      },
+      include: {
+        models: true,
+        specificationKeys: { include: { options: true } },
+      },
     });
-    res.json(product);
+
+    // Process nested models if provided
+    if (Array.isArray(models)) {
+      for (const m of models) {
+        if (m.name) {
+          const existingModel = await prisma.productModel.findFirst({
+            where: { productId: product.id, name: m.name },
+          });
+          if (!existingModel) {
+            await prisma.productModel.create({
+              data: {
+                productId: product.id,
+                name: m.name,
+                basePrice: m.basePrice || 0,
+              },
+            });
+          }
+        }
+      }
+    }
+
+    // Process nested specification keys & options if provided
+    if (Array.isArray(specificationKeys)) {
+      for (const sk of specificationKeys) {
+        if (sk.name) {
+          let specKey = await prisma.specificationKey.findFirst({
+            where: { productId: product.id, name: sk.name },
+          });
+          if (!specKey) {
+            specKey = await prisma.specificationKey.create({
+              data: {
+                productId: product.id,
+                name: sk.name,
+                inputType: sk.inputType || 'SELECT',
+              },
+            });
+          }
+          if (Array.isArray(sk.options)) {
+            for (const opt of sk.options) {
+              if (opt.label) {
+                const existingOpt = await prisma.specificationOption.findFirst({
+                  where: { specificationKeyId: specKey.id, label: opt.label },
+                });
+                if (!existingOpt) {
+                  await prisma.specificationOption.create({
+                    data: {
+                      specificationKeyId: specKey.id,
+                      label: opt.label,
+                      priceModifier: opt.priceModifier || 0,
+                    },
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const updatedProduct = await prisma.product.findUnique({
+      where: { id: product.id },
+      include: { models: true, specificationKeys: { include: { options: true } } },
+    });
+
+    res.json(updatedProduct);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -150,9 +236,19 @@ app.get('/api/customers', async (req, res) => {
 
 app.post('/api/customers', async (req, res) => {
   try {
-    const customer = await prisma.customer.create({
-      data: req.body,
-    });
+    const { id, taxId, name, companyName, customerType, email, phone, address, city, notes } = req.body;
+    let customer;
+    if (id) {
+      customer = await prisma.customer.upsert({
+        where: { id },
+        update: { name, companyName, customerType, email, phone, address, city, notes },
+        create: { name, companyName, customerType, email, phone, address, city, notes },
+      });
+    } else {
+      customer = await prisma.customer.create({
+        data: { name, companyName, customerType, email, phone, address, city, notes },
+      });
+    }
     res.json(customer);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -178,8 +274,17 @@ app.get('/api/offers', async (req, res) => {
 app.post('/api/offers', async (req, res) => {
   try {
     const { offerNumber, customerId, createdByUserId, taxRate, subtotal, taxAmount, totalAmount, items } = req.body;
-    const offer = await prisma.offer.create({
-      data: {
+    const offer = await prisma.offer.upsert({
+      where: { offerNumber },
+      update: {
+        customerId,
+        createdByUserId,
+        taxRate,
+        subtotal,
+        taxAmount,
+        totalAmount,
+      },
+      create: {
         offerNumber,
         customerId,
         createdByUserId,
@@ -218,8 +323,11 @@ app.get('/api/projects', async (req, res) => {
 
 app.post('/api/projects', async (req, res) => {
   try {
-    const project = await prisma.project.create({
-      data: req.body,
+    const { projectNumber, offerId, customerId, status, procurementStatus, procurementNotes } = req.body;
+    const project = await prisma.project.upsert({
+      where: { projectNumber },
+      update: { status, procurementStatus, procurementNotes },
+      create: { projectNumber, offerId, customerId, status: status || 'PLANNED', procurementStatus, procurementNotes },
       include: { customer: true, offer: true },
     });
     res.json(project);
@@ -246,8 +354,11 @@ app.get('/api/service-tickets', async (req, res) => {
 
 app.post('/api/service-tickets', async (req, res) => {
   try {
-    const ticket = await prisma.serviceTicket.create({
-      data: req.body,
+    const { ticketNumber, customerId, installedItemId, defectDescription, priority, status, laborHours, solution } = req.body;
+    const ticket = await prisma.serviceTicket.upsert({
+      where: { ticketNumber },
+      update: { priority, status, laborHours, solution },
+      create: { ticketNumber, customerId, installedItemId, defectDescription, priority: priority || 'MEDIUM', status: status || 'OPEN', laborHours, solution },
       include: { customer: true, installedItem: true },
     });
     res.json(ticket);

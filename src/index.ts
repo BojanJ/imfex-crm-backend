@@ -56,14 +56,17 @@ app.post('/api/email/send-offer', async (req, res) => {
       });
     }
 
-    const attachments = pdfBase64
-      ? [
-          {
-            filename: `${offerNumber || 'Offer'}.pdf`,
-            content: pdfBase64.replace(/^data:application\/pdf;base64,/, ''),
-          },
-        ]
-      : [];
+    let attachments: { filename: string; content: Buffer }[] = [];
+    if (pdfBase64) {
+      const cleanBase64 = String(pdfBase64).replace(/^data:.*?;base64,/, '').trim();
+      const pdfBuffer = Buffer.from(cleanBase64, 'base64');
+      attachments = [
+        {
+          filename: `${offerNumber || 'Offer'}.pdf`,
+          content: pdfBuffer,
+        },
+      ];
+    }
 
     const htmlContent = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b; line-height: 1.6;">
@@ -100,7 +103,7 @@ app.post('/api/email/send-offer', async (req, res) => {
       </div>
     `;
 
-    const data = await resend.emails.send({
+    const result = await resend.emails.send({
       from: EMAIL_FROM,
       to: [to],
       subject: `Комерцијална Понуда ${offerNumber || ''} - ИМФЕКС ЕКСПОРТ-ИМПОРТ`,
@@ -108,7 +111,11 @@ app.post('/api/email/send-offer', async (req, res) => {
       attachments,
     });
 
-    res.json({ success: true, id: data.id });
+    if (result.error) {
+      return res.status(400).json({ error: result.error.message });
+    }
+
+    res.json({ success: true, id: result.data?.id });
   } catch (error: any) {
     console.error('Send offer email error:', error);
     res.status(500).json({ error: error.message });
@@ -157,14 +164,18 @@ app.post('/api/email/welcome-user', async (req, res) => {
       </div>
     `;
 
-    const data = await resend.emails.send({
+    const result = await resend.emails.send({
       from: EMAIL_FROM,
       to: [to],
       subject: `Добредојдовте во IMFEX Enterprise CRM - Податоци за најава`,
       html: htmlContent,
     });
 
-    res.json({ success: true, id: data.id });
+    if (result.error) {
+      return res.status(400).json({ error: result.error.message });
+    }
+
+    res.json({ success: true, id: result.data?.id });
   } catch (error: any) {
     console.error('Send welcome email error:', error);
     res.status(500).json({ error: error.message });
@@ -208,14 +219,18 @@ app.post('/api/email/reset-password', async (req, res) => {
       </div>
     `;
 
-    const data = await resend.emails.send({
+    const result = await resend.emails.send({
       from: EMAIL_FROM,
       to: [to],
       subject: `Ресетирање на лозинка - IMFEX Enterprise CRM`,
       html: htmlContent,
     });
 
-    res.json({ success: true, id: data.id });
+    if (result.error) {
+      return res.status(400).json({ error: result.error.message });
+    }
+
+    res.json({ success: true, id: result.data?.id });
   } catch (error: any) {
     console.error('Send reset password email error:', error);
     res.status(500).json({ error: error.message });

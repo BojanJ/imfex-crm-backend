@@ -1,19 +1,28 @@
 import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
 export async function seedDatabase() {
   console.log('🌱 Starting IMFEX CRM Database Seeding (Macedonian)...');
 
+  const adminPasswordHash = bcrypt.hashSync('admin123', 10);
+  const salesPasswordHash = bcrypt.hashSync('sales123', 10);
+
   // 1. Seed Demo Profiles / Users
   const superAdmin = await prisma.profile.upsert({
     where: { email: 'admin@imfex.com' },
-    update: {},
+    update: {
+      passwordHash: adminPasswordHash,
+      mustChangePassword: false,
+      status: 'ACTIVE',
+    },
     create: {
       id: '11111111-1111-1111-1111-111111111111',
       email: 'admin@imfex.com',
       fullName: 'Супер Администратор',
       role: 'SUPER_ADMIN',
+      passwordHash: adminPasswordHash,
       mustChangePassword: false,
       status: 'ACTIVE',
     },
@@ -21,18 +30,23 @@ export async function seedDatabase() {
 
   const salesUser = await prisma.profile.upsert({
     where: { email: 'sales@imfex.com' },
-    update: {},
+    update: {
+      passwordHash: salesPasswordHash,
+      mustChangePassword: false,
+      status: 'ACTIVE',
+    },
     create: {
       id: '22222222-2222-2222-2222-222222222222',
       email: 'sales@imfex.com',
       fullName: 'Менаџер за Продажба',
       role: 'USER',
+      passwordHash: salesPasswordHash,
       mustChangePassword: false,
       status: 'ACTIVE',
     },
   });
 
-  console.log('✅ Profiles seeded: admin@imfex.com & sales@imfex.com');
+  console.log('✅ Profiles seeded with bcrypt password hashes: admin@imfex.com (admin123) & sales@imfex.com (sales123)');
 
   // 2. Seed Products
   const garageDoor = await prisma.product.upsert({

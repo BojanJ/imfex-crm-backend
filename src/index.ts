@@ -2,19 +2,28 @@ import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
+import { Resend } from 'resend';
 
 const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 4000;
 
+// Initialize Resend Email Service
+const resendApiKey = process.env.RESEND_API_KEY || '';
+const resend = resendApiKey ? new Resend(resendApiKey) : null;
+const EMAIL_FROM = process.env.EMAIL_FROM || 'IMFEX CRM <onboarding@resend.dev>';
+
+// Support payload up to 10MB for PDF base64 attachments
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Health Check Endpoint for Render
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'IMFEX Enterprise CRM Backend',
+    emailConfigured: Boolean(resendApiKey),
     timestamp: new Date().toISOString(),
   });
 });
@@ -23,9 +32,199 @@ app.get('/', (req, res) => {
   res.json({
     message: 'Welcome to IMFEX Enterprise CRM Backend API',
     health: '/health',
+    emailConfigured: Boolean(resendApiKey),
     version: '1.0.0',
   });
 });
+
+// ==========================================
+// EMAIL TRANSACTIONAL API ENDPOINTS
+// ==========================================
+
+// 1. Send Offer PDF to Customer
+app.post('/api/email/send-offer', async (req, res) => {
+  try {
+    const { to, customerName, offerNumber, totalAmount, pdfBase64, customMessage } = req.body;
+
+    if (!to) {
+      return res.status(400).json({ error: 'Recipient email address (to) is required.' });
+    }
+
+    if (!resend) {
+      return res.status(503).json({
+        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables.',
+      });
+    }
+
+    const attachments = pdfBase64
+      ? [
+          {
+            filename: `${offerNumber || 'Offer'}.pdf`,
+            content: pdfBase64.replace(/^data:application\/pdf;base64,/, ''),
+          },
+        ]
+      : [];
+
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b; line-height: 1.6;">
+        <div style="background-color: #0f172a; padding: 24px; text-align: center; border-radius: 12px 12px 0 0;">
+          <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">
+            ИМФЕКС ЕКСПОРТ-ИМПОРТ ДООЕЛ
+          </h1>
+          <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 12px;">Комерцијална Понуда • ${offerNumber || ''}</p>
+        </div>
+
+        <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px; background-color: #ffffff;">
+          <p style="font-size: 14px; font-weight: 700; color: #0f172a;">Почитувани ${customerName || 'Клиент'},</p>
+          <p style="font-size: 13px; color: #334155;">
+            Во прилог на оваа порака Ви ја испраќаме официјалната комерцијална понуда <strong>${offerNumber || ''}</strong> со вкупен износ од <strong>€${Number(totalAmount || 0).toFixed(2)}</strong>.
+          </p>
+
+          ${
+            customMessage
+              ? `<div style="background-color: #f8fafc; border-left: 4px solid #2563eb; padding: 12px; margin: 16px 0; font-size: 12px; color: #475569; font-style: italic;">
+                  "${customMessage}"
+                </div>`
+              : ''
+          }
+
+          <p style="font-size: 13px; color: #334155;">
+            Ве молиме прегледајте го прикачениот PDF документ за детална спецификација на производите и условите за испорака.
+          </p>
+
+          <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #64748b; text-align: center;">
+            <p style="margin: 0; font-weight: 700;">ИМФЕКС ЕКСПОРТ-ИМПОРТ ДООЕЛ Скопје</p>
+            <p style="margin: 2px 0 0 0;">Ул. Качанички Пат бб, Скопје | Тел: +389 2 3123 456 | Email: info@imfex.com</p>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const data = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: [to],
+      subject: `Комерцијална Понуда ${offerNumber || ''} - ИМФЕКС ЕКСПОРТ-ИМПОРТ`,
+      html: htmlContent,
+      attachments,
+    });
+
+    res.json({ success: true, id: data.id });
+  } catch (error: any) {
+    console.error('Send offer email error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. Send Welcome & Temporary Password Email to New User
+app.post('/api/email/welcome-user', async (req, res) => {
+  try {
+    const { to, fullName, tempPassword, role } = req.body;
+
+    if (!to || !fullName) {
+      return res.status(400).json({ error: 'Recipient email and full name are required.' });
+    }
+
+    if (!resend) {
+      return res.status(503).json({
+        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables.',
+      });
+    }
+
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
+        <div style="background-color: #0f172a; padding: 24px; text-align: center; border-radius: 12px 12px 0 0;">
+          <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 800;">
+            Добредојдовте во IMFEX Enterprise CRM
+          </h1>
+        </div>
+
+        <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px; background-color: #ffffff;">
+          <p style="font-size: 14px; font-weight: 700;">Здраво ${fullName},</p>
+          <p style="font-size: 13px;">
+            Креиран е нов кориснички сметка за Вес на платформата за управување со клиенти и понуди на <strong>ИМФЕКС</strong>.
+          </p>
+
+          <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; margin: 16px 0; font-size: 13px;">
+            <p style="margin: 0 0 8px 0;"><strong>Е-пошта:</strong> ${to}</p>
+            <p style="margin: 0 0 8px 0;"><strong>Привремена лозинка:</strong> <span style="font-family: monospace; font-size: 14px; color: #2563eb; font-weight: 700;">${tempPassword || 'IMFEX123!'}</span></p>
+            <p style="margin: 0;"><strong>Улога:</strong> ${role || 'Корисник'}</p>
+          </div>
+
+          <p style="font-size: 12px; color: #64748b;">
+            При првата најава, ќе биде побарано да ја промените вашата привремена лозинка за безбедност.
+          </p>
+        </div>
+      </div>
+    `;
+
+    const data = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: [to],
+      subject: `Добредојдовте во IMFEX Enterprise CRM - Податоци за најава`,
+      html: htmlContent,
+    });
+
+    res.json({ success: true, id: data.id });
+  } catch (error: any) {
+    console.error('Send welcome email error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 3. Send Password Reset Email
+app.post('/api/email/reset-password', async (req, res) => {
+  try {
+    const { to, tempPassword } = req.body;
+
+    if (!to) {
+      return res.status(400).json({ error: 'Recipient email is required.' });
+    }
+
+    if (!resend) {
+      return res.status(503).json({
+        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables.',
+      });
+    }
+
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
+        <div style="background-color: #0f172a; padding: 24px; text-align: center; border-radius: 12px 12px 0 0;">
+          <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 800;">
+            Ресетирање на Лозинка • IMFEX CRM
+          </h1>
+        </div>
+
+        <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px; background-color: #ffffff;">
+          <p style="font-size: 14px;">Побарано е ресетирање на вашата лозинка за IMFEX CRM.</p>
+
+          <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; margin: 16px 0; font-size: 13px;">
+            <p style="margin: 0;"><strong>Вашата нова привремена лозинка е:</strong> <span style="font-family: monospace; font-size: 14px; color: #dc2626; font-weight: 700;">${tempPassword || 'TempPass2026!'}</span></p>
+          </div>
+
+          <p style="font-size: 12px; color: #64748b;">
+            Ве молиме најавете се со оваа лозинка и веднаш променете ја во Нагодувања.
+          </p>
+        </div>
+      </div>
+    `;
+
+    const data = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: [to],
+      subject: `Ресетирање на лозинка - IMFEX Enterprise CRM`,
+      html: htmlContent,
+    });
+
+    res.json({ success: true, id: data.id });
+  } catch (error: any) {
+    console.error('Send reset password email error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// EXISTING CRUD & AUTH ENDPOINTS
+// ==========================================
 
 // Auth API
 app.post('/api/auth/login', async (req, res) => {
@@ -102,7 +301,7 @@ app.post('/api/profiles', async (req, res) => {
   }
 });
 
-// Products API (Idempotent Upsert & Specs Support)
+// Products API
 app.get('/api/products', async (req, res) => {
   try {
     const products = await prisma.product.findMany({
@@ -148,7 +347,6 @@ app.post('/api/products', async (req, res) => {
       },
     });
 
-    // Process nested models if provided
     if (Array.isArray(models)) {
       for (const m of models) {
         if (m.name) {
@@ -168,7 +366,6 @@ app.post('/api/products', async (req, res) => {
       }
     }
 
-    // Process nested specification keys & options if provided
     if (Array.isArray(specificationKeys)) {
       for (const sk of specificationKeys) {
         if (sk.name) {
@@ -236,7 +433,7 @@ app.get('/api/customers', async (req, res) => {
 
 app.post('/api/customers', async (req, res) => {
   try {
-    const { id, taxId, name, companyName, customerType, email, phone, address, city, notes } = req.body;
+    const { id, name, companyName, customerType, email, phone, address, city, notes } = req.body;
     let customer;
     if (id) {
       customer = await prisma.customer.upsert({

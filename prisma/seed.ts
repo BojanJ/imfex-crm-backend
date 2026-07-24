@@ -14,6 +14,8 @@ export async function seedDatabase() {
       email: 'admin@imfex.com',
       fullName: 'Супер Администратор',
       role: 'SUPER_ADMIN',
+      mustChangePassword: false,
+      status: 'ACTIVE',
     },
   });
 
@@ -25,6 +27,8 @@ export async function seedDatabase() {
       email: 'sales@imfex.com',
       fullName: 'Менаџер за Продажба',
       role: 'USER',
+      mustChangePassword: false,
+      status: 'ACTIVE',
     },
   });
 

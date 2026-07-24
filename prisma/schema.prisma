@@ -60,14 +60,17 @@ enum ServiceStatus {
 }
 
 model Profile {
-  id               String          @id @db.Uuid
-  email            String          @unique
-  fullName         String?         @map("full_name")
-  role             UserRole        @default(USER)
-  createdAt        DateTime        @default(now()) @map("created_at")
-  offers           Offer[]
-  managedProjects  Project[]       @relation("ProjectResponsible")
-  assignedServices ServiceTicket[] @relation("ServiceTechnician")
+  id                 String          @id @default(uuid()) @db.Uuid
+  email              String          @unique
+  fullName           String?         @map("full_name")
+  passwordHash       String?         @map("password_hash")
+  mustChangePassword Boolean         @default(true) @map("must_change_password")
+  status             String          @default("ACTIVE")
+  role               UserRole        @default(USER)
+  createdAt          DateTime        @default(now()) @map("created_at")
+  offers             Offer[]
+  managedProjects    Project[]       @relation("ProjectResponsible")
+  assignedServices   ServiceTicket[] @relation("ServiceTechnician")
 
   @@map("profiles")
 }

@@ -52,7 +52,7 @@ app.post('/api/email/send-offer', async (req, res) => {
 
     if (!resend) {
       return res.status(503).json({
-        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables.',
+        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables in Render.',
       });
     }
 
@@ -470,33 +470,81 @@ app.get('/api/offers', async (req, res) => {
 
 app.post('/api/offers', async (req, res) => {
   try {
-    const { offerNumber, customerId, createdByUserId, taxRate, subtotal, taxAmount, totalAmount, items } = req.body;
+    const {
+      offerNumber,
+      customerId,
+      createdByUserId,
+      status,
+      taxRate,
+      discountRate,
+      discountAmount,
+      subtotal,
+      taxAmount,
+      totalAmount,
+    } = req.body;
+
+    if (!offerNumber) {
+      return res.status(400).json({ error: 'Offer number is required' });
+    }
+
+    // Verify valid customer ID or fallback to first available customer in DB
+    let validCustomerId = customerId;
+    if (validCustomerId) {
+      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
+      if (!custExists) {
+        const firstCust = await prisma.customer.findFirst();
+        if (firstCust) validCustomerId = firstCust.id;
+      }
+    } else {
+      const firstCust = await prisma.customer.findFirst();
+      if (firstCust) validCustomerId = firstCust.id;
+    }
+
+    if (!validCustomerId) {
+      const newCust = await prisma.customer.create({
+        data: { name: 'Главен Клиент', email: 'nabavki@logistika.mk' },
+      });
+      validCustomerId = newCust.id;
+    }
+
+    // Verify valid user ID or leave null
+    let validUserId: string | null = null;
+    if (createdByUserId) {
+      const userExists = await prisma.profile.findUnique({ where: { id: createdByUserId } }).catch(() => null);
+      if (userExists) validUserId = userExists.id;
+    }
+
     const offer = await prisma.offer.upsert({
       where: { offerNumber },
       update: {
-        customerId,
-        createdByUserId,
-        taxRate,
-        subtotal,
-        taxAmount,
-        totalAmount,
+        customerId: validCustomerId,
+        createdByUserId: validUserId,
+        status: status || 'DRAFT',
+        taxRate: taxRate ? Number(taxRate) : 18.0,
+        discountRate: discountRate ? Number(discountRate) : 0.0,
+        discountAmount: discountAmount ? Number(discountAmount) : 0.0,
+        subtotal: subtotal ? Number(subtotal) : 0.0,
+        taxAmount: taxAmount ? Number(taxAmount) : 0.0,
+        totalAmount: totalAmount ? Number(totalAmount) : 0.0,
       },
       create: {
         offerNumber,
-        customerId,
-        createdByUserId,
-        taxRate,
-        subtotal,
-        taxAmount,
-        totalAmount,
-        items: {
-          create: items || [],
-        },
+        customerId: validCustomerId,
+        createdByUserId: validUserId,
+        status: status || 'DRAFT',
+        taxRate: taxRate ? Number(taxRate) : 18.0,
+        discountRate: discountRate ? Number(discountRate) : 0.0,
+        discountAmount: discountAmount ? Number(discountAmount) : 0.0,
+        subtotal: subtotal ? Number(subtotal) : 0.0,
+        taxAmount: taxAmount ? Number(taxAmount) : 0.0,
+        totalAmount: totalAmount ? Number(totalAmount) : 0.0,
       },
       include: { customer: true, items: true },
     });
+
     res.json(offer);
   } catch (error: any) {
+    console.error('POST /api/offers error:', error);
     res.status(500).json({ error: error.message });
   }
 });

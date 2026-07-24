@@ -80,6 +80,26 @@ app.get('/api/profiles', async (req, res) => {
   }
 });
 
+app.post('/api/profiles', async (req, res) => {
+  try {
+    const { email, fullName, role, password } = req.body;
+    const passwordHash = password ? bcrypt.hashSync(password, 10) : bcrypt.hashSync('IMFEX2026!', 10);
+    const profile = await prisma.profile.create({
+      data: {
+        email: email.toLowerCase(),
+        fullName,
+        role: role || 'USER',
+        passwordHash,
+        mustChangePassword: true,
+        status: 'ACTIVE',
+      },
+    });
+    res.json(profile);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Products API
 app.get('/api/products', async (req, res) => {
   try {
@@ -94,6 +114,18 @@ app.get('/api/products', async (req, res) => {
       },
     });
     res.json(products);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/products', async (req, res) => {
+  try {
+    const { name, code, description, isActive } = req.body;
+    const product = await prisma.product.create({
+      data: { name, code, description, isActive: isActive ?? true },
+    });
+    res.json(product);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -116,6 +148,17 @@ app.get('/api/customers', async (req, res) => {
   }
 });
 
+app.post('/api/customers', async (req, res) => {
+  try {
+    const customer = await prisma.customer.create({
+      data: req.body,
+    });
+    res.json(customer);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Offers API
 app.get('/api/offers', async (req, res) => {
   try {
@@ -127,6 +170,30 @@ app.get('/api/offers', async (req, res) => {
       },
     });
     res.json(offers);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/offers', async (req, res) => {
+  try {
+    const { offerNumber, customerId, createdByUserId, taxRate, subtotal, taxAmount, totalAmount, items } = req.body;
+    const offer = await prisma.offer.create({
+      data: {
+        offerNumber,
+        customerId,
+        createdByUserId,
+        taxRate,
+        subtotal,
+        taxAmount,
+        totalAmount,
+        items: {
+          create: items || [],
+        },
+      },
+      include: { customer: true, items: true },
+    });
+    res.json(offer);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -149,6 +216,18 @@ app.get('/api/projects', async (req, res) => {
   }
 });
 
+app.post('/api/projects', async (req, res) => {
+  try {
+    const project = await prisma.project.create({
+      data: req.body,
+      include: { customer: true, offer: true },
+    });
+    res.json(project);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Service Tickets API
 app.get('/api/service-tickets', async (req, res) => {
   try {
@@ -160,6 +239,18 @@ app.get('/api/service-tickets', async (req, res) => {
       },
     });
     res.json(tickets);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/service-tickets', async (req, res) => {
+  try {
+    const ticket = await prisma.serviceTicket.create({
+      data: req.body,
+      include: { customer: true, installedItem: true },
+    });
+    res.json(ticket);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

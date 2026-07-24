@@ -1,0 +1,289 @@
+// Prisma Schema for IMFEX CRM
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  USER
+}
+
+enum SpecInputType {
+  SELECT
+  MULTISELECT
+  TEXT
+  NUMBER
+}
+
+enum CustomerType {
+  INDIVIDUAL
+  COMPANY
+  PARTNER
+  OTHER
+}
+
+enum OfferStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+enum ProjectStatus {
+  PLANNED
+  PROCUREMENT
+  PRODUCTION
+  INSTALLATION
+  COMPLETED
+  CLOSED
+}
+
+enum ServicePriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ServiceStatus {
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  CLOSED
+}
+
+model Profile {
+  id               String          @id @db.Uuid
+  email            String          @unique
+  fullName         String?         @map("full_name")
+  role             UserRole        @default(USER)
+  createdAt        DateTime        @default(now()) @map("created_at")
+  offers           Offer[]
+  managedProjects  Project[]       @relation("ProjectResponsible")
+  assignedServices ServiceTicket[] @relation("ServiceTechnician")
+
+  @@map("profiles")
+}
+
+model Product {
+  id                String             @id @default(uuid()) @db.Uuid
+  name              String
+  code              String             @unique
+  description       String?
+  isActive          Boolean            @default(true) @map("is_active")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  models            ProductModel[]
+  specificationKeys SpecificationKey[]
+  offerItems        OfferItem[]
+  installedItems    InstalledItem[]
+
+  @@map("products")
+}
+
+model ProductModel {
+  id         String      @id @default(uuid()) @db.Uuid
+  productId  String      @map("product_id") @db.Uuid
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name       String
+  basePrice  Decimal     @default(0.00) @map("base_price") @db.Decimal(10, 2)
+  createdAt  DateTime    @default(now()) @map("created_at")
+  offerItems OfferItem[]
+
+  @@map("product_models")
+}
+
+model SpecificationKey {
+  id                      String                   @id @default(uuid()) @db.Uuid
+  productId               String                   @map("product_id") @db.Uuid
+  product                 Product                  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name                    String
+  inputType               SpecInputType            @default(SELECT) @map("input_type")
+  createdAt               DateTime                 @default(now()) @map("created_at")
+  options                 SpecificationOption[]
+  offerItemSpecifications OfferItemSpecification[]
+
+  @@map("specification_keys")
+}
+
+model SpecificationOption {
+  id                      String                   @id @default(uuid()) @db.Uuid
+  specificationKeyId      String                   @map("specification_key_id") @db.Uuid
+  specificationKey        SpecificationKey         @relation(fields: [specificationKeyId], references: [id], onDelete: Cascade)
+  label                   String
+  priceModifier           Decimal                  @default(0.00) @map("price_modifier") @db.Decimal(10, 2)
+  createdAt               DateTime                 @default(now()) @map("created_at")
+  offerItemSpecifications OfferItemSpecification[]
+
+  @@map("specification_options")
+}
+
+model Customer {
+  id             String          @id @default(uuid()) @db.Uuid
+  customerType   CustomerType    @default(INDIVIDUAL) @map("customer_type")
+  name           String
+  companyName    String?         @map("company_name")
+  taxId          String?         @map("tax_id")
+  email          String?
+  phone          String?
+  address        String?
+  city           String?
+  notes          String?
+  createdAt      DateTime        @default(now()) @map("created_at")
+  offers         Offer[]
+  projects       Project[]
+  documents      ClientDocument[]
+  installedItems InstalledItem[]
+  serviceTickets ServiceTicket[]
+
+  @@map("customers")
+}
+
+model Offer {
+  id              String      @id @default(uuid()) @db.Uuid
+  offerNumber     String      @unique @map("offer_number")
+  customerId      String      @map("customer_id") @db.Uuid
+  customer        Customer    @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  createdByUserId String?     @map("created_by_user_id") @db.Uuid
+  createdByUser   Profile?    @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+  status          OfferStatus @default(DRAFT)
+  taxRate         Decimal     @default(18.00) @map("tax_rate") @db.Decimal(5, 2)
+  discountRate    Decimal     @default(0.00) @map("discount_rate") @db.Decimal(5, 2)
+  discountAmount  Decimal     @default(0.00) @map("discount_amount") @db.Decimal(10, 2)
+  subtotal        Decimal     @default(0.00) @db.Decimal(10, 2)
+  taxAmount       Decimal     @default(0.00) @map("tax_amount") @db.Decimal(10, 2)
+  totalAmount     Decimal     @default(0.00) @map("total_amount") @db.Decimal(10, 2)
+  validUntil      DateTime?   @map("valid_until") @db.Date
+  createdAt       DateTime    @default(now()) @map("created_at")
+  items           OfferItem[]
+  project         Project?
+  documents       ClientDocument[]
+
+  @@map("offers")
+}
+
+model OfferItem {
+  id                      String                   @id @default(uuid()) @db.Uuid
+  offerId                 String                   @map("offer_id") @db.Uuid
+  offer                   Offer                    @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  serviceTypes            String[]                 @map("service_types")
+  productId               String?                  @map("product_id") @db.Uuid
+  product                 Product?                 @relation(fields: [productId], references: [id], onDelete: SetNull)
+  productModelId          String?                  @map("product_model_id") @db.Uuid
+  productModel            ProductModel?            @relation(fields: [productModelId], references: [id], onDelete: SetNull)
+  customTitle             String?                  @map("custom_title")
+  widthMm                 Int?                     @map("width_mm")
+  heightMm                Int?                     @map("height_mm")
+  quantity                Int                      @default(1)
+  unitPrice               Decimal                  @default(0.00) @map("unit_price") @db.Decimal(10, 2)
+  totalPrice              Decimal                  @default(0.00) @map("total_price") @db.Decimal(10, 2)
+  createdAt               DateTime                 @default(now()) @map("created_at")
+  offerItemSpecifications OfferItemSpecification[]
+
+  @@map("offer_items")
+}
+
+model OfferItemSpecification {
+  id                    String               @id @default(uuid()) @db.Uuid
+  offerItemId           String               @map("offer_item_id") @db.Uuid
+  offerItem             OfferItem            @relation(fields: [offerItemId], references: [id], onDelete: Cascade)
+  specificationKeyId    String               @map("specification_key_id") @db.Uuid
+  specificationKey      SpecificationKey     @relation(fields: [specificationKeyId], references: [id], onDelete: Cascade)
+  specificationOptionId String?              @map("specification_option_id") @db.Uuid
+  specificationOption   SpecificationOption? @relation(fields: [specificationOptionId], references: [id], onDelete: Cascade)
+  customValue           String?              @map("custom_value")
+  createdAt             DateTime             @default(now()) @map("created_at")
+
+  @@map("offer_item_specifications")
+}
+
+model Project {
+  id                   String        @id @default(uuid()) @db.Uuid
+  projectNumber        String        @unique @map("project_number")
+  offerId              String        @unique @map("offer_id") @db.Uuid
+  offer                Offer         @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  customerId           String        @map("customer_id") @db.Uuid
+  customer             Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  responsibleUserId    String?       @map("responsible_user_id") @db.Uuid
+  responsibleUser      Profile?      @relation("ProjectResponsible", fields: [responsibleUserId], references: [id], onDelete: SetNull)
+  status               ProjectStatus @default(PLANNED)
+  startDate            DateTime?     @map("start_date") @db.Date
+  targetDeliveryDate   DateTime?     @map("target_delivery_date") @db.Date
+  actualDeliveryDate   DateTime?     @map("actual_delivery_date") @db.Date
+  procurementStatus    String?       @map("procurement_status")
+  procurementNotes     String?       @map("procurement_notes")
+  installationTeam     String?       @map("installation_team")
+  installationDate     DateTime?     @map("installation_date") @db.Date
+  installationAddress  String?       @map("installation_address")
+  installationContact  String?       @map("installation_contact")
+  installationMinutes  String?       @map("installation_minutes")
+  signatureUrl         String?       @map("signature_url")
+  createdAt            DateTime      @default(now()) @map("created_at")
+  documents            ClientDocument[]
+  installedItems       InstalledItem[]
+
+  @@map("projects")
+}
+
+model InstalledItem {
+  id               String          @id @default(uuid()) @db.Uuid
+  customerId       String          @map("customer_id") @db.Uuid
+  customer         Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  projectId        String?         @map("project_id") @db.Uuid
+  project          Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  productId        String?         @map("product_id") @db.Uuid
+  product          Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
+  title            String
+  serialNumber     String?         @map("serial_number")
+  installationDate DateTime        @default(now()) @map("installation_date")
+  serviceTickets   ServiceTicket[]
+
+  @@map("installed_items")
+}
+
+model ServiceTicket {
+  id                   String          @id @default(uuid()) @db.Uuid
+  ticketNumber         String          @unique @map("ticket_number")
+  customerId           String          @map("customer_id") @db.Uuid
+  customer             Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  installedItemId      String?         @map("installed_item_id") @db.Uuid
+  installedItem        InstalledItem?  @relation(fields: [installedItemId], references: [id], onDelete: SetNull)
+  defectDescription    String          @map("defect_description")
+  priority             ServicePriority @default(MEDIUM)
+  status               ServiceStatus   @default(OPEN)
+  assignedTechnicianId String?         @map("assigned_technician_id") @db.Uuid
+  assignedTechnician   Profile?        @relation("ServiceTechnician", fields: [assignedTechnicianId], references: [id], onDelete: SetNull)
+  scheduledDate        DateTime?       @map("scheduled_date")
+  partsConsumed        Json?           @map("parts_consumed")
+  laborHours           Decimal         @default(0.00) @map("labor_hours") @db.Decimal(5, 2)
+  solution             String?
+  closedAt             DateTime?       @map("closed_at")
+  createdAt            DateTime        @default(now()) @map("created_at")
+  documents            ClientDocument[]
+
+  @@map("service_tickets")
+}
+
+model ClientDocument {
+  id          String         @id @default(uuid()) @db.Uuid
+  customerId  String         @map("customer_id") @db.Uuid
+  customer    Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  offerId     String?        @map("offer_id") @db.Uuid
+  offer       Offer?         @relation(fields: [offerId], references: [id], onDelete: SetNull)
+  projectId   String?        @map("project_id") @db.Uuid
+  project     Project?       @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  serviceId   String?        @map("service_id") @db.Uuid
+  service     ServiceTicket? @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  title       String
+  fileType    String         @map("file_type")
+  fileUrl     String         @map("file_url")
+  createdAt   DateTime       @default(now()) @map("created_at")
+
+  @@map("client_documents")
+}

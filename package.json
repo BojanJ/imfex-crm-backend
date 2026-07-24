@@ -5,8 +5,11 @@
   "scripts": {
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
-    "db:seed": "ts-node prisma/seed.ts",
+    "db:seed": "npx tsx prisma/seed.ts",
     "db:generate": "prisma generate"
+  },
+  "prisma": {
+    "seed": "npx tsx prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "6.4.0"
@@ -15,6 +18,7 @@
     "@types/node": "^22.10.2",
     "prisma": "6.4.0",
     "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
 }

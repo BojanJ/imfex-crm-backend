@@ -337,30 +337,56 @@ app.get('/api/products', async (req, res) => {
 
 app.post('/api/products', async (req, res) => {
   try {
-    const { name, code, description, isActive, models, specificationKeys } = req.body;
+    const { id, name, code, description, isActive, models, specificationKeys } = req.body;
 
     if (!code) {
       return res.status(400).json({ error: 'Product code is required' });
     }
 
-    const product = await prisma.product.upsert({
-      where: { code },
-      update: {
-        name,
-        description,
-        isActive: isActive ?? true,
-      },
-      create: {
-        name,
-        code,
-        description,
-        isActive: isActive ?? true,
-      },
-      include: {
-        models: true,
-        specificationKeys: { include: { options: true } },
-      },
-    });
+    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    let product;
+
+    if (isUuid) {
+      product = await prisma.product.upsert({
+        where: { id },
+        update: {
+          name,
+          code,
+          description,
+          isActive: isActive !== undefined ? isActive : true,
+        },
+        create: {
+          id,
+          name,
+          code,
+          description,
+          isActive: isActive !== undefined ? isActive : true,
+        },
+        include: {
+          models: true,
+          specificationKeys: { include: { options: true } },
+        },
+      });
+    } else {
+      product = await prisma.product.upsert({
+        where: { code },
+        update: {
+          name,
+          description,
+          isActive: isActive !== undefined ? isActive : true,
+        },
+        create: {
+          name,
+          code,
+          description,
+          isActive: isActive !== undefined ? isActive : true,
+        },
+        include: {
+          models: true,
+          specificationKeys: { include: { options: true } },
+        },
+      });
+    }
 
     if (Array.isArray(models)) {
       for (const m of models) {
@@ -425,6 +451,9 @@ app.post('/api/products', async (req, res) => {
 
     res.json(updatedProduct);
   } catch (error: any) {
+    if (error.code === 'P2002') {
+      return res.status(400).json({ error: 'Product with this code already exists.' });
+    }
     res.status(500).json({ error: error.message });
   }
 });

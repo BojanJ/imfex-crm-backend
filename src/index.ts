@@ -641,6 +641,23 @@ app.get('/api/offers', async (req, res) => {
   }
 });
 
+app.get('/api/offers/:id', async (req, res) => {
+  try {
+    const offer = await prisma.offer.findUnique({
+      where: { id: req.params.id },
+      include: {
+        customer: true,
+        createdByUser: true,
+        items: true,
+      },
+    });
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    res.json(offer);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/offers', async (req, res) => {
   try {
     const {

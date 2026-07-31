@@ -37,6 +37,66 @@ app.get('/', (req, res) => {
   });
 });
 
+// Admin Database Cleanup & UTF-8 Sync Endpoint
+app.all('/api/admin/clean-database', async (req, res) => {
+  try {
+    const allCust = await prisma.customer.findMany();
+    const corruptedCust = allCust.filter(
+      (c) => (c.name && c.name.includes('?')) || (c.companyName && c.companyName.includes('?'))
+    );
+
+    for (const c of corruptedCust) {
+      await prisma.offerItem.deleteMany({ where: { offer: { customerId: c.id } } });
+      await prisma.offer.deleteMany({ where: { customerId: c.id } });
+      await prisma.project.deleteMany({ where: { customerId: c.id } });
+      await prisma.serviceTicket.deleteMany({ where: { customerId: c.id } });
+      await prisma.installedItem.deleteMany({ where: { customerId: c.id } });
+      await prisma.customer.delete({ where: { id: c.id } });
+    }
+
+    let customerCorp = await prisma.customer.findFirst({ where: { taxId: 'MK4030012345678' } });
+    if (!customerCorp || customerCorp.name.includes('?')) {
+      customerCorp = await prisma.customer.create({
+        data: {
+          customerType: 'COMPANY',
+          name: 'Логистички Центар Скопје ДООЕЛ',
+          companyName: 'Логистички Центар Скопје ДООЕЛ',
+          taxId: 'MK4030012345678',
+          email: 'nabavki@logistika.mk',
+          phone: '+389 2 3123 456',
+          address: 'Ул. Индустриска бр. 42',
+          city: 'Скопје',
+          notes: 'Главен комерцијален клиент. Стандардно фактурирање со 18% ДДВ.',
+        },
+      });
+    }
+
+    let customerInd = await prisma.customer.findFirst({ where: { email: 'alex.stojanovski@gmail.com' } });
+    if (!customerInd || customerInd.name.includes('?')) {
+      customerInd = await prisma.customer.create({
+        data: {
+          customerType: 'INDIVIDUAL',
+          name: 'Александар Стојановски',
+          companyName: '',
+          email: 'alex.stojanovski@gmail.com',
+          phone: '+389 70 888 999',
+          address: 'Ул. Партизански Одреди 74',
+          city: 'Скопје',
+          notes: 'Редовен индивидуален купувач.',
+        },
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Database cleaned and verified with clean UTF-8 records.',
+      purgedCorruptedCount: corruptedCust.length,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==========================================
 // EMAIL TRANSACTIONAL API ENDPOINTS
 // ==========================================

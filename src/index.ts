@@ -97,6 +97,75 @@ app.all('/api/admin/clean-database', async (req, res) => {
   }
 });
 
+// Admin Fresh Database Wipe Endpoint (0 records, 2 System Users)
+app.all('/api/admin/reset-database', async (req, res) => {
+  try {
+    await prisma.offerItem.deleteMany();
+    await prisma.offer.deleteMany();
+    await prisma.project.deleteMany();
+    await prisma.serviceTicket.deleteMany();
+    await prisma.installedItem.deleteMany();
+    await prisma.clientDocument.deleteMany();
+    await prisma.customer.deleteMany();
+    await prisma.specificationOption.deleteMany();
+    await prisma.specificationKey.deleteMany();
+    await prisma.productModel.deleteMany();
+    await prisma.product.deleteMany();
+
+    await prisma.profile.deleteMany({
+      where: {
+        email: { notIn: ['admin@imfex.com', 'sales@imfex.com'] },
+      },
+    });
+
+    const adminPasswordHash = bcrypt.hashSync('admin123', 10);
+    const salesPasswordHash = bcrypt.hashSync('sales123', 10);
+
+    await prisma.profile.upsert({
+      where: { email: 'admin@imfex.com' },
+      update: {
+        passwordHash: adminPasswordHash,
+        mustChangePassword: false,
+        status: 'ACTIVE',
+      },
+      create: {
+        id: '11111111-1111-1111-1111-111111111111',
+        email: 'admin@imfex.com',
+        fullName: 'Супер Администратор',
+        role: 'SUPER_ADMIN',
+        passwordHash: adminPasswordHash,
+        mustChangePassword: false,
+        status: 'ACTIVE',
+      },
+    });
+
+    await prisma.profile.upsert({
+      where: { email: 'sales@imfex.com' },
+      update: {
+        passwordHash: salesPasswordHash,
+        mustChangePassword: false,
+        status: 'ACTIVE',
+      },
+      create: {
+        id: '22222222-2222-2222-2222-222222222222',
+        email: 'sales@imfex.com',
+        fullName: 'Менаџер за Продажба',
+        role: 'USER',
+        passwordHash: salesPasswordHash,
+        mustChangePassword: false,
+        status: 'ACTIVE',
+      },
+    });
+
+    res.json({
+      success: true,
+      message: 'Database reset cleanly to fresh state. 0 records, 2 system users active (admin@imfex.com & sales@imfex.com).',
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==========================================
 // EMAIL TRANSACTIONAL API ENDPOINTS
 // ==========================================

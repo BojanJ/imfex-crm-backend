@@ -1192,7 +1192,8 @@ app.get('/api/calendar-events', async (req, res) => {
     });
     res.json(events);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('GET /api/calendar-events database error:', error?.message || error);
+    res.json([]);
   }
 });
 
@@ -1260,6 +1261,7 @@ app.post('/api/calendar-events', async (req, res) => {
 
     res.json(event);
   } catch (error: any) {
+    console.error('POST /api/calendar-events error:', error?.message || error);
     res.status(500).json({ error: error.message });
   }
 });

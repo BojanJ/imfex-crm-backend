@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "npx tsx src/index.ts",
+    "start": "npx prisma db push --accept-data-loss && npx tsx src/index.ts",
     "dev": "npx tsx src/index.ts",
-    "build": "prisma generate && tsc",
+    "build": "prisma db push --accept-data-loss && prisma generate && tsc",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:seed": "npx tsx prisma/seed.ts",

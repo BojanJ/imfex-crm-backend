@@ -145,6 +145,7 @@ model Customer {
   documents      ClientDocument[]
   installedItems InstalledItem[]
   serviceTickets ServiceTicket[]
+  calendarEvents CalendarEvent[]
 
   @@map("customers")
 }
@@ -291,3 +292,21 @@ model ClientDocument {
 
   @@map("client_documents")
 }
+
+model CalendarEvent {
+  id          String    @id @default(uuid()) @db.Uuid
+  title       String
+  description String?
+  startDate   String    @map("start_date")
+  endDate     String?   @map("end_date")
+  allDay      Boolean   @default(false) @map("all_day")
+  eventType   String    @default("MEETING") @map("event_type")
+  customerId  String?   @map("customer_id") @db.Uuid
+  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  location    String?
+  color       String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@map("calendar_events")
+}
+

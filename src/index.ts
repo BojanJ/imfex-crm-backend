@@ -106,6 +106,7 @@ app.all('/api/admin/reset-database', async (req, res) => {
     await prisma.serviceTicket.deleteMany();
     await prisma.installedItem.deleteMany();
     await prisma.clientDocument.deleteMany();
+    await prisma.calendarEvent.deleteMany();
     await prisma.customer.deleteMany();
     await prisma.specificationOption.deleteMany();
     await prisma.specificationKey.deleteMany();
@@ -445,6 +446,40 @@ app.post('/api/profiles', async (req, res) => {
   }
 });
 
+app.put('/api/profiles/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { fullName, role, status, password } = req.body;
+    const updateData: any = {};
+    if (fullName !== undefined) updateData.fullName = fullName;
+    if (role !== undefined) updateData.role = role;
+    if (status !== undefined) updateData.status = status;
+    if (password) {
+      updateData.passwordHash = bcrypt.hashSync(password, 10);
+      updateData.mustChangePassword = false;
+    }
+
+    const profile = await prisma.profile.update({
+      where: { id },
+      data: updateData,
+    });
+    const { passwordHash, ...userWithoutPassword } = profile;
+    res.json(userWithoutPassword);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/profiles/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.profile.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Products API
 app.get('/api/products', async (req, res) => {
   try {
@@ -587,6 +622,16 @@ app.post('/api/products', async (req, res) => {
   }
 });
 
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.product.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Customers API
 app.get('/api/customers', async (req, res) => {
   try {
@@ -607,19 +652,31 @@ app.get('/api/customers', async (req, res) => {
 app.post('/api/customers', async (req, res) => {
   try {
     const { id, name, companyName, customerType, email, phone, address, city, notes } = req.body;
+    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
     let customer;
-    if (id) {
+    if (isUuid) {
       customer = await prisma.customer.upsert({
         where: { id },
-        update: { name, companyName, customerType, email, phone, address, city, notes },
-        create: { name, companyName, customerType, email, phone, address, city, notes },
+        update: { name: name || 'Клиент', companyName, customerType: customerType || 'COMPANY', email, phone, address, city, notes },
+        create: { id, name: name || 'Клиент', companyName, customerType: customerType || 'COMPANY', email, phone, address, city, notes },
       });
     } else {
       customer = await prisma.customer.create({
-        data: { name, companyName, customerType, email, phone, address, city, notes },
+        data: { name: name || 'Клиент', companyName, customerType: customerType || 'COMPANY', email, phone, address, city, notes },
       });
     }
     res.json(customer);
+  } catch (error: any) {
+    console.error('POST /api/customers error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/customers/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.customer.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -671,13 +728,13 @@ app.post('/api/offers', async (req, res) => {
       subtotal,
       taxAmount,
       totalAmount,
+      items,
     } = req.body;
 
     if (!offerNumber) {
       return res.status(400).json({ error: 'Offer number is required' });
     }
 
-    // Verify valid customer ID or fallback to first available customer in DB
     let validCustomerId = customerId;
     if (validCustomerId) {
       const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
@@ -697,7 +754,6 @@ app.post('/api/offers', async (req, res) => {
       validCustomerId = newCust.id;
     }
 
-    // Verify valid user ID or leave null
     let validUserId: string | null = null;
     if (createdByUserId) {
       const userExists = await prisma.profile.findUnique({ where: { id: createdByUserId } }).catch(() => null);
@@ -732,9 +788,46 @@ app.post('/api/offers', async (req, res) => {
       include: { customer: true, items: true },
     });
 
-    res.json(offer);
+    if (Array.isArray(items)) {
+      await prisma.offerItem.deleteMany({ where: { offerId: offer.id } });
+      for (const item of items) {
+        const isProdUuid = item.productId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.productId);
+        const isModelUuid = item.productModelId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.productModelId);
+        await prisma.offerItem.create({
+          data: {
+            offerId: offer.id,
+            productId: isProdUuid ? item.productId : null,
+            productModelId: isModelUuid ? item.productModelId : null,
+            customTitle: item.customTitle || '',
+            serviceTypes: Array.isArray(item.serviceTypes) ? item.serviceTypes : [],
+            widthMm: item.widthMm ? Number(item.widthMm) : null,
+            heightMm: item.heightMm ? Number(item.heightMm) : null,
+            quantity: item.quantity ? Number(item.quantity) : 1,
+            unitPrice: item.unitPrice ? Number(item.unitPrice) : 0,
+            totalPrice: item.totalPrice ? Number(item.totalPrice) : 0,
+          },
+        });
+      }
+    }
+
+    const fullOffer = await prisma.offer.findUnique({
+      where: { id: offer.id },
+      include: { customer: true, items: true, createdByUser: true },
+    });
+
+    res.json(fullOffer);
   } catch (error: any) {
     console.error('POST /api/offers error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/offers/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.offer.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
+  } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
@@ -758,14 +851,112 @@ app.get('/api/projects', async (req, res) => {
 
 app.post('/api/projects', async (req, res) => {
   try {
-    const { projectNumber, offerId, customerId, status, procurementStatus, procurementNotes } = req.body;
+    const {
+      projectNumber,
+      offerId,
+      customerId,
+      status,
+      procurementStatus,
+      procurementNotes,
+      responsibleUserId,
+      startDate,
+      targetDeliveryDate,
+      actualDeliveryDate,
+      installationTeam,
+      installationDate,
+      installationAddress,
+      installationContact,
+      installationMinutes,
+      signatureUrl,
+    } = req.body;
+
+    let validOfferId = offerId;
+    if (validOfferId) {
+      const offerExists = await prisma.offer.findUnique({ where: { id: validOfferId } }).catch(() => null);
+      if (!offerExists) validOfferId = null;
+    }
+
+    let validCustomerId = customerId;
+    if (validCustomerId) {
+      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
+      if (!custExists) {
+        const firstCust = await prisma.customer.findFirst();
+        if (firstCust) validCustomerId = firstCust.id;
+      }
+    }
+
+    if (!validCustomerId || !validOfferId) {
+      if (!validCustomerId) {
+        const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
+        validCustomerId = newCust.id;
+      }
+      if (!validOfferId) {
+        const newOffer = await prisma.offer.create({
+          data: {
+            offerNumber: `OFF-TMP-${Date.now()}`,
+            customerId: validCustomerId,
+            status: 'ACCEPTED',
+          },
+        });
+        validOfferId = newOffer.id;
+      }
+    }
+
+    let validRespUser = responsibleUserId;
+    if (validRespUser) {
+      const userExists = await prisma.profile.findUnique({ where: { id: validRespUser } }).catch(() => null);
+      if (!userExists) validRespUser = null;
+    }
+
     const project = await prisma.project.upsert({
       where: { projectNumber },
-      update: { status, procurementStatus, procurementNotes },
-      create: { projectNumber, offerId, customerId, status: status || 'PLANNED', procurementStatus, procurementNotes },
-      include: { customer: true, offer: true },
+      update: {
+        status: status || 'PLANNED',
+        procurementStatus,
+        procurementNotes,
+        responsibleUserId: validRespUser,
+        startDate: startDate ? new Date(startDate) : undefined,
+        targetDeliveryDate: targetDeliveryDate ? new Date(targetDeliveryDate) : undefined,
+        actualDeliveryDate: actualDeliveryDate ? new Date(actualDeliveryDate) : undefined,
+        installationTeam,
+        installationDate: installationDate ? new Date(installationDate) : undefined,
+        installationAddress,
+        installationContact,
+        installationMinutes,
+        signatureUrl,
+      },
+      create: {
+        projectNumber,
+        offerId: validOfferId,
+        customerId: validCustomerId,
+        status: status || 'PLANNED',
+        procurementStatus,
+        procurementNotes,
+        responsibleUserId: validRespUser,
+        startDate: startDate ? new Date(startDate) : undefined,
+        targetDeliveryDate: targetDeliveryDate ? new Date(targetDeliveryDate) : undefined,
+        actualDeliveryDate: actualDeliveryDate ? new Date(actualDeliveryDate) : undefined,
+        installationTeam,
+        installationDate: installationDate ? new Date(installationDate) : undefined,
+        installationAddress,
+        installationContact,
+        installationMinutes,
+        signatureUrl,
+      },
+      include: { customer: true, offer: true, responsibleUser: true },
     });
     res.json(project);
+  } catch (error: any) {
+    console.error('POST /api/projects error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/projects/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.project.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -789,14 +980,295 @@ app.get('/api/service-tickets', async (req, res) => {
 
 app.post('/api/service-tickets', async (req, res) => {
   try {
-    const { ticketNumber, customerId, installedItemId, defectDescription, priority, status, laborHours, solution } = req.body;
+    const {
+      ticketNumber,
+      customerId,
+      installedItemId,
+      defectDescription,
+      priority,
+      status,
+      laborHours,
+      solution,
+      assignedTechnicianId,
+      scheduledDate,
+      partsConsumed,
+      closedAt,
+    } = req.body;
+
+    let validCustomerId = customerId;
+    if (validCustomerId) {
+      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
+      if (!custExists) {
+        const firstCust = await prisma.customer.findFirst();
+        if (firstCust) validCustomerId = firstCust.id;
+      }
+    }
+    if (!validCustomerId) {
+      const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
+      validCustomerId = newCust.id;
+    }
+
+    let validItem = installedItemId;
+    if (validItem) {
+      const itemExists = await prisma.installedItem.findUnique({ where: { id: validItem } }).catch(() => null);
+      if (!itemExists) validItem = null;
+    }
+
+    let validTech = assignedTechnicianId;
+    if (validTech) {
+      const techExists = await prisma.profile.findUnique({ where: { id: validTech } }).catch(() => null);
+      if (!techExists) validTech = null;
+    }
+
     const ticket = await prisma.serviceTicket.upsert({
       where: { ticketNumber },
-      update: { priority, status, laborHours, solution },
-      create: { ticketNumber, customerId, installedItemId, defectDescription, priority: priority || 'MEDIUM', status: status || 'OPEN', laborHours, solution },
-      include: { customer: true, installedItem: true },
+      update: {
+        priority: priority || 'MEDIUM',
+        status: status || 'OPEN',
+        defectDescription: defectDescription || 'Пријавен дефект',
+        laborHours: laborHours ? Number(laborHours) : 0,
+        solution,
+        assignedTechnicianId: validTech,
+        scheduledDate: scheduledDate ? new Date(scheduledDate) : undefined,
+        partsConsumed,
+        closedAt: closedAt ? new Date(closedAt) : undefined,
+      },
+      create: {
+        ticketNumber,
+        customerId: validCustomerId,
+        installedItemId: validItem,
+        defectDescription: defectDescription || 'Пријавен дефект',
+        priority: priority || 'MEDIUM',
+        status: status || 'OPEN',
+        laborHours: laborHours ? Number(laborHours) : 0,
+        solution,
+        assignedTechnicianId: validTech,
+        scheduledDate: scheduledDate ? new Date(scheduledDate) : undefined,
+        partsConsumed,
+        closedAt: closedAt ? new Date(closedAt) : undefined,
+      },
+      include: { customer: true, installedItem: true, assignedTechnician: true },
     });
     res.json(ticket);
+  } catch (error: any) {
+    console.error('POST /api/service-tickets error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/service-tickets/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.serviceTicket.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Installed Items API
+app.get('/api/installed-items', async (req, res) => {
+  try {
+    const items = await prisma.installedItem.findMany({
+      include: { customer: true, project: true, product: true },
+    });
+    res.json(items);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/installed-items', async (req, res) => {
+  try {
+    const { id, customerId, projectId, productId, title, serialNumber, installationDate } = req.body;
+    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    let validCustomerId = customerId;
+    if (validCustomerId) {
+      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
+      if (!custExists) {
+        const firstCust = await prisma.customer.findFirst();
+        if (firstCust) validCustomerId = firstCust.id;
+      }
+    }
+    if (!validCustomerId) {
+      const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
+      validCustomerId = newCust.id;
+    }
+
+    let item;
+    if (isUuid) {
+      item = await prisma.installedItem.upsert({
+        where: { id },
+        update: { title, serialNumber, installationDate: installationDate ? new Date(installationDate) : undefined },
+        create: { id, customerId: validCustomerId, projectId, productId, title, serialNumber, installationDate: installationDate ? new Date(installationDate) : undefined },
+      });
+    } else {
+      item = await prisma.installedItem.create({
+        data: { customerId: validCustomerId, projectId, productId, title, serialNumber, installationDate: installationDate ? new Date(installationDate) : undefined },
+      });
+    }
+    res.json(item);
+  } catch (error: any) {
+    console.error('POST /api/installed-items error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/installed-items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.installedItem.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Client Documents API
+app.get('/api/client-documents', async (req, res) => {
+  try {
+    const docs = await prisma.clientDocument.findMany({
+      include: { customer: true },
+    });
+    res.json(docs);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/client-documents', async (req, res) => {
+  try {
+    const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl } = req.body;
+    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    let validCustomerId = customerId;
+    if (validCustomerId) {
+      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
+      if (!custExists) {
+        const firstCust = await prisma.customer.findFirst();
+        if (firstCust) validCustomerId = firstCust.id;
+      }
+    }
+    if (!validCustomerId) {
+      const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
+      validCustomerId = newCust.id;
+    }
+
+    let doc;
+    if (isUuid) {
+      doc = await prisma.clientDocument.upsert({
+        where: { id },
+        update: { title, fileType, fileUrl },
+        create: { id, customerId: validCustomerId, offerId, projectId, serviceId, title, fileType, fileUrl },
+      });
+    } else {
+      doc = await prisma.clientDocument.create({
+        data: { customerId: validCustomerId, offerId, projectId, serviceId, title, fileType, fileUrl },
+      });
+    }
+    res.json(doc);
+  } catch (error: any) {
+    console.error('POST /api/client-documents error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/client-documents/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.clientDocument.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Calendar Events API
+app.get('/api/calendar-events', async (req, res) => {
+  try {
+    const events = await prisma.calendarEvent.findMany({
+      include: {
+        customer: true,
+      },
+    });
+    res.json(events);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/calendar-events', async (req, res) => {
+  try {
+    const { id, title, description, startDate, endDate, allDay, eventType, customerId, location, color } = req.body;
+
+    if (!title || !startDate) {
+      return res.status(400).json({ error: 'Title and startDate are required' });
+    }
+
+    let validCustomerId = customerId;
+    if (validCustomerId) {
+      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
+      if (!custExists) validCustomerId = null;
+    }
+
+    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+    let event;
+    if (isUuid) {
+      event = await prisma.calendarEvent.upsert({
+        where: { id },
+        update: {
+          title,
+          description,
+          startDate,
+          endDate,
+          allDay: Boolean(allDay),
+          eventType: eventType || 'MEETING',
+          customerId: validCustomerId,
+          location,
+          color,
+        },
+        create: {
+          id,
+          title,
+          description,
+          startDate,
+          endDate,
+          allDay: Boolean(allDay),
+          eventType: eventType || 'MEETING',
+          customerId: validCustomerId,
+          location,
+          color,
+        },
+        include: { customer: true },
+      });
+    } else {
+      event = await prisma.calendarEvent.create({
+        data: {
+          title,
+          description,
+          startDate,
+          endDate,
+          allDay: Boolean(allDay),
+          eventType: eventType || 'MEETING',
+          customerId: validCustomerId,
+          location,
+          color,
+        },
+        include: { customer: true },
+      });
+    }
+
+    res.json(event);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/calendar-events/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.calendarEvent.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

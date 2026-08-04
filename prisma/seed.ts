@@ -166,6 +166,28 @@ export async function seedDatabase() {
   });
 
   console.log(`✅ Sample Offer Created/Updated: ${sampleOffer.offerNumber}`);
+
+  // 6. Seed Sample Calendar Event
+  const sampleMeeting = await prisma.calendarEvent.upsert({
+    where: { id: 'c1111111-1111-1111-1111-111111111111' },
+    update: {
+      customerId: customerCorp.id,
+    },
+    create: {
+      id: 'c1111111-1111-1111-1111-111111111111',
+      title: 'Теренски увид и премер - Логистички Центар',
+      description: 'Состанок за димензионирање на гаражни врати во нов објект',
+      startDate: new Date().toISOString().split('T')[0] + 'T10:00',
+      endDate: new Date().toISOString().split('T')[0] + 'T11:30',
+      allDay: false,
+      eventType: 'MEETING',
+      customerId: customerCorp.id,
+      location: 'Ул. Индустриска бр. 42, Скопје',
+      color: 'purple',
+    },
+  });
+
+  console.log(`✅ Sample Calendar Event Seeded: ${sampleMeeting.title}`);
   console.log('🎉 Seeding finished successfully!');
 }
 

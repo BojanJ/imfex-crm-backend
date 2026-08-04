@@ -682,6 +682,22 @@ app.delete('/api/customers/:id', async (req, res) => {
   }
 });
 
+// Helper to format offer item specifications
+const formatOfferForResponse = (offer: any) => {
+  if (!offer) return offer;
+  return {
+    ...offer,
+    items: (offer.items || []).map((item: any) => ({
+      ...item,
+      specifications: (item.offerItemSpecifications || item.specifications || []).map((s: any) => ({
+        specificationKeyId: s.specificationKeyId,
+        specificationOptionId: s.specificationOptionId || undefined,
+        customValue: s.customValue || undefined,
+      })),
+    })),
+  };
+};
+
 // Offers API
 app.get('/api/offers', async (req, res) => {
   try {
@@ -689,10 +705,14 @@ app.get('/api/offers', async (req, res) => {
       include: {
         customer: true,
         createdByUser: true,
-        items: true,
+        items: {
+          include: {
+            offerItemSpecifications: true,
+          },
+        },
       },
     });
-    res.json(offers);
+    res.json(offers.map(formatOfferForResponse));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -705,11 +725,15 @@ app.get('/api/offers/:id', async (req, res) => {
       include: {
         customer: true,
         createdByUser: true,
-        items: true,
+        items: {
+          include: {
+            offerItemSpecifications: true,
+          },
+        },
       },
     });
     if (!offer) return res.status(404).json({ error: 'Offer not found' });
-    res.json(offer);
+    res.json(formatOfferForResponse(offer));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -793,7 +817,7 @@ app.post('/api/offers', async (req, res) => {
       for (const item of items) {
         const isProdUuid = item.productId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.productId);
         const isModelUuid = item.productModelId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.productModelId);
-        await prisma.offerItem.create({
+        const createdItem = await prisma.offerItem.create({
           data: {
             offerId: offer.id,
             productId: isProdUuid ? item.productId : null,
@@ -807,15 +831,44 @@ app.post('/api/offers', async (req, res) => {
             totalPrice: item.totalPrice ? Number(item.totalPrice) : 0,
           },
         });
+
+        const rawSpecs = Array.isArray(item.specifications)
+          ? item.specifications
+          : Array.isArray(item.offerItemSpecifications)
+          ? item.offerItemSpecifications
+          : [];
+
+        for (const spec of rawSpecs) {
+          const isSpecKeyUuid = spec.specificationKeyId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec.specificationKeyId);
+          const isSpecOptUuid = spec.specificationOptionId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec.specificationOptionId);
+          if (isSpecKeyUuid) {
+            await prisma.offerItemSpecification.create({
+              data: {
+                offerItemId: createdItem.id,
+                specificationKeyId: spec.specificationKeyId,
+                specificationOptionId: isSpecOptUuid ? spec.specificationOptionId : null,
+                customValue: spec.customValue || null,
+              },
+            });
+          }
+        }
       }
     }
 
     const fullOffer = await prisma.offer.findUnique({
       where: { id: offer.id },
-      include: { customer: true, items: true, createdByUser: true },
+      include: {
+        customer: true,
+        createdByUser: true,
+        items: {
+          include: {
+            offerItemSpecifications: true,
+          },
+        },
+      },
     });
 
-    res.json(fullOffer);
+    res.json(formatOfferForResponse(fullOffer));
   } catch (error: any) {
     console.error('POST /api/offers error:', error);
     res.status(500).json({ error: error.message });

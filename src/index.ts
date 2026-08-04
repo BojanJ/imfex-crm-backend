@@ -741,7 +741,8 @@ app.get('/api/offers/:id', async (req, res) => {
 
 app.post('/api/offers', async (req, res) => {
   try {
-    const {
+    let {
+      id,
       offerNumber,
       customerId,
       createdByUserId,
@@ -755,62 +756,89 @@ app.post('/api/offers', async (req, res) => {
       items,
     } = req.body;
 
-    if (!offerNumber) {
-      return res.status(400).json({ error: 'Offer number is required' });
-    }
+    const isUuid = (val?: string | null) =>
+      Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
 
-    let validCustomerId = customerId;
+    let validCustomerId = isUuid(customerId) ? customerId : null;
     if (validCustomerId) {
       const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) {
-        const firstCust = await prisma.customer.findFirst();
-        if (firstCust) validCustomerId = firstCust.id;
-      }
-    } else {
-      const firstCust = await prisma.customer.findFirst();
-      if (firstCust) validCustomerId = firstCust.id;
+      if (!custExists) validCustomerId = null;
     }
-
     if (!validCustomerId) {
-      const newCust = await prisma.customer.create({
-        data: { name: 'Главен Клиент', email: 'nabavki@logistika.mk' },
-      });
-      validCustomerId = newCust.id;
+      const firstCust = await prisma.customer.findFirst();
+      if (firstCust) {
+        validCustomerId = firstCust.id;
+      } else {
+        const newCust = await prisma.customer.create({
+          data: { name: 'Главен Клиент', email: 'nabavki@logistika.mk' },
+        });
+        validCustomerId = newCust.id;
+      }
     }
 
     let validUserId: string | null = null;
-    if (createdByUserId) {
+    if (isUuid(createdByUserId)) {
       const userExists = await prisma.profile.findUnique({ where: { id: createdByUserId } }).catch(() => null);
       if (userExists) validUserId = userExists.id;
     }
 
-    const offer = await prisma.offer.upsert({
-      where: { offerNumber },
-      update: {
-        customerId: validCustomerId,
-        createdByUserId: validUserId,
-        status: status || 'DRAFT',
-        taxRate: taxRate ? Number(taxRate) : 18.0,
-        discountRate: discountRate ? Number(discountRate) : 0.0,
-        discountAmount: discountAmount ? Number(discountAmount) : 0.0,
-        subtotal: subtotal ? Number(subtotal) : 0.0,
-        taxAmount: taxAmount ? Number(taxAmount) : 0.0,
-        totalAmount: totalAmount ? Number(totalAmount) : 0.0,
-      },
-      create: {
-        offerNumber,
-        customerId: validCustomerId,
-        createdByUserId: validUserId,
-        status: status || 'DRAFT',
-        taxRate: taxRate ? Number(taxRate) : 18.0,
-        discountRate: discountRate ? Number(discountRate) : 0.0,
-        discountAmount: discountAmount ? Number(discountAmount) : 0.0,
-        subtotal: subtotal ? Number(subtotal) : 0.0,
-        taxAmount: taxAmount ? Number(taxAmount) : 0.0,
-        totalAmount: totalAmount ? Number(totalAmount) : 0.0,
-      },
-      include: { customer: true, items: true },
-    });
+    // Check if offer exists by ID or offerNumber
+    let existingOffer = null;
+    if (isUuid(id)) {
+      existingOffer = await prisma.offer.findUnique({ where: { id } }).catch(() => null);
+    }
+    if (!existingOffer && offerNumber) {
+      existingOffer = await prisma.offer.findUnique({ where: { offerNumber } }).catch(() => null);
+    }
+
+    let offer;
+    if (existingOffer) {
+      offer = await prisma.offer.update({
+        where: { id: existingOffer.id },
+        data: {
+          customerId: validCustomerId,
+          createdByUserId: validUserId,
+          status: status || existingOffer.status || 'DRAFT',
+          taxRate: taxRate !== undefined ? Number(taxRate) : existingOffer.taxRate,
+          discountRate: discountRate !== undefined ? Number(discountRate) : existingOffer.discountRate,
+          discountAmount: discountAmount !== undefined ? Number(discountAmount) : existingOffer.discountAmount,
+          subtotal: subtotal !== undefined ? Number(subtotal) : existingOffer.subtotal,
+          taxAmount: taxAmount !== undefined ? Number(taxAmount) : existingOffer.taxAmount,
+          totalAmount: totalAmount !== undefined ? Number(totalAmount) : existingOffer.totalAmount,
+        },
+      });
+    } else {
+      let uniqueOfferNumber = offerNumber;
+      if (!uniqueOfferNumber) {
+        const count = await prisma.offer.count();
+        uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${String(count + 1).padStart(4, '0')}`;
+      }
+
+      let conflict = await prisma.offer.findUnique({ where: { offerNumber: uniqueOfferNumber } }).catch(() => null);
+      let attempts = 0;
+      while (conflict && attempts < 10) {
+        attempts++;
+        const rand = Math.floor(1000 + Math.random() * 9000);
+        uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${rand}`;
+        conflict = await prisma.offer.findUnique({ where: { offerNumber: uniqueOfferNumber } }).catch(() => null);
+      }
+
+      offer = await prisma.offer.create({
+        data: {
+          ...(isUuid(id) ? { id } : {}),
+          offerNumber: uniqueOfferNumber,
+          customerId: validCustomerId,
+          createdByUserId: validUserId,
+          status: status || 'DRAFT',
+          taxRate: taxRate ? Number(taxRate) : 18.0,
+          discountRate: discountRate ? Number(discountRate) : 0.0,
+          discountAmount: discountAmount ? Number(discountAmount) : 0.0,
+          subtotal: subtotal ? Number(subtotal) : 0.0,
+          taxAmount: taxAmount ? Number(taxAmount) : 0.0,
+          totalAmount: totalAmount ? Number(totalAmount) : 0.0,
+        },
+      });
+    }
 
     if (Array.isArray(items)) {
       await prisma.offerItem.deleteMany({ where: { offerId: offer.id } });
@@ -1200,30 +1228,62 @@ app.get('/api/client-documents', async (req, res) => {
 app.post('/api/client-documents', async (req, res) => {
   try {
     const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl } = req.body;
-    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-    let validCustomerId = customerId;
+    const isUuid = (val?: string | null) =>
+      Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
+
+    let validCustomerId = isUuid(customerId) ? customerId : null;
     if (validCustomerId) {
       const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) {
-        const firstCust = await prisma.customer.findFirst();
-        if (firstCust) validCustomerId = firstCust.id;
-      }
+      if (!custExists) validCustomerId = null;
     }
     if (!validCustomerId) {
-      const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
-      validCustomerId = newCust.id;
+      const firstCust = await prisma.customer.findFirst();
+      if (firstCust) {
+        validCustomerId = firstCust.id;
+      } else {
+        const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
+        validCustomerId = newCust.id;
+      }
     }
 
+    const validOfferId = isUuid(offerId) ? offerId : null;
+    const validProjectId = isUuid(projectId) ? projectId : null;
+    const validServiceId = isUuid(serviceId) ? serviceId : null;
+
     let doc;
-    if (isUuid) {
+    if (isUuid(id)) {
       doc = await prisma.clientDocument.upsert({
         where: { id },
-        update: { title, fileType, fileUrl },
-        create: { id, customerId: validCustomerId, offerId, projectId, serviceId, title, fileType, fileUrl },
+        update: {
+          title: title || 'Документ',
+          fileType: fileType || 'application/pdf',
+          fileUrl: fileUrl || '',
+          offerId: validOfferId,
+          projectId: validProjectId,
+          serviceId: validServiceId,
+        },
+        create: {
+          id,
+          customerId: validCustomerId,
+          offerId: validOfferId,
+          projectId: validProjectId,
+          serviceId: validServiceId,
+          title: title || 'Документ',
+          fileType: fileType || 'application/pdf',
+          fileUrl: fileUrl || '',
+        },
       });
     } else {
       doc = await prisma.clientDocument.create({
-        data: { customerId: validCustomerId, offerId, projectId, serviceId, title, fileType, fileUrl },
+        data: {
+          customerId: validCustomerId,
+          offerId: validOfferId,
+          projectId: validProjectId,
+          serviceId: validServiceId,
+          title: title || 'Документ',
+          fileType: fileType || 'application/pdf',
+          fileUrl: fileUrl || '',
+        },
       });
     }
     res.json(doc);

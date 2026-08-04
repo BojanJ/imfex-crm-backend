@@ -842,14 +842,22 @@ app.post('/api/offers', async (req, res) => {
           const isSpecKeyUuid = spec.specificationKeyId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec.specificationKeyId);
           const isSpecOptUuid = spec.specificationOptionId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec.specificationOptionId);
           if (isSpecKeyUuid) {
-            await prisma.offerItemSpecification.create({
-              data: {
-                offerItemId: createdItem.id,
-                specificationKeyId: spec.specificationKeyId,
-                specificationOptionId: isSpecOptUuid ? spec.specificationOptionId : null,
-                customValue: spec.customValue || null,
-              },
-            });
+            const specKeyExists = await prisma.specificationKey.findUnique({ where: { id: spec.specificationKeyId } }).catch(() => null);
+            if (specKeyExists) {
+              let validOptId: string | null = null;
+              if (isSpecOptUuid) {
+                const optExists = await prisma.specificationOption.findUnique({ where: { id: spec.specificationOptionId } }).catch(() => null);
+                if (optExists) validOptId = spec.specificationOptionId;
+              }
+              await prisma.offerItemSpecification.create({
+                data: {
+                  offerItemId: createdItem.id,
+                  specificationKeyId: spec.specificationKeyId,
+                  specificationOptionId: validOptId,
+                  customValue: spec.customValue || null,
+                },
+              }).catch((e) => console.warn('Skipping offerItemSpecification insert warning:', e?.message || e));
+            }
           }
         }
       }

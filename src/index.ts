@@ -480,11 +480,59 @@ app.delete('/api/profiles/:id', async (req, res) => {
   }
 });
 
+// Categories API
+app.get('/api/categories', async (req, res) => {
+  try {
+    const categories = await prisma.productCategory.findMany({
+      include: {
+        children: true,
+      },
+    });
+    res.json(categories);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/categories', async (req, res) => {
+  try {
+    const { id, name, parentId } = req.body;
+    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    let category;
+
+    if (isUuid) {
+      category = await prisma.productCategory.upsert({
+        where: { id },
+        update: { name, parentId: parentId || null },
+        create: { id, name, parentId: parentId || null },
+      });
+    } else {
+      category = await prisma.productCategory.create({
+        data: { name, parentId: parentId || null },
+      });
+    }
+    res.json(category);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/categories/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.productCategory.delete({ where: { id } }).catch(() => null);
+    res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Products API
 app.get('/api/products', async (req, res) => {
   try {
     const products = await prisma.product.findMany({
       include: {
+        category: true,
         models: true,
         specificationKeys: {
           include: {
@@ -501,7 +549,7 @@ app.get('/api/products', async (req, res) => {
 
 app.post('/api/products', async (req, res) => {
   try {
-    const { id, name, code, description, isActive, models, specificationKeys } = req.body;
+    const { id, name, code, description, isActive, models, specificationKeys, categoryId } = req.body;
 
     if (!code) {
       return res.status(400).json({ error: 'Product code is required' });
@@ -518,6 +566,7 @@ app.post('/api/products', async (req, res) => {
           code,
           description,
           isActive: isActive !== undefined ? isActive : true,
+          categoryId: categoryId || null,
         },
         create: {
           id,
@@ -525,8 +574,10 @@ app.post('/api/products', async (req, res) => {
           code,
           description,
           isActive: isActive !== undefined ? isActive : true,
+          categoryId: categoryId || null,
         },
         include: {
+          category: true,
           models: true,
           specificationKeys: { include: { options: true } },
         },
@@ -538,14 +589,17 @@ app.post('/api/products', async (req, res) => {
           name,
           description,
           isActive: isActive !== undefined ? isActive : true,
+          categoryId: categoryId || null,
         },
         create: {
           name,
           code,
           description,
           isActive: isActive !== undefined ? isActive : true,
+          categoryId: categoryId || null,
         },
         include: {
+          category: true,
           models: true,
           specificationKeys: { include: { options: true } },
         },
@@ -610,7 +664,7 @@ app.post('/api/products', async (req, res) => {
 
     const updatedProduct = await prisma.product.findUnique({
       where: { id: product.id },
-      include: { models: true, specificationKeys: { include: { options: true } } },
+      include: { category: true, models: true, specificationKeys: { include: { options: true } } },
     });
 
     res.json(updatedProduct);

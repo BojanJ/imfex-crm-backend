@@ -1001,6 +1001,24 @@ app.get('/api/projects', async (req, res) => {
   }
 });
 
+app.get('/api/projects/:id', async (req, res) => {
+  try {
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      include: {
+        customer: true,
+        offer: true,
+        responsibleUser: true,
+        installedItems: true,
+      },
+    });
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json(project);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/projects', async (req, res) => {
   try {
     const {
@@ -1114,6 +1132,15 @@ app.delete('/api/projects/:id', async (req, res) => {
   }
 });
 
+// Helper to format service ticket Decimal fields
+const formatTicketForResponse = (ticket: any) => {
+  if (!ticket) return ticket;
+  return {
+    ...ticket,
+    laborHours: Number(ticket.laborHours || 0),
+  };
+};
+
 // Service Tickets API
 app.get('/api/service-tickets', async (req, res) => {
   try {
@@ -1124,7 +1151,24 @@ app.get('/api/service-tickets', async (req, res) => {
         assignedTechnician: true,
       },
     });
-    res.json(tickets);
+    res.json(tickets.map(formatTicketForResponse));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/service-tickets/:id', async (req, res) => {
+  try {
+    const ticket = await prisma.serviceTicket.findUnique({
+      where: { id: req.params.id },
+      include: {
+        customer: true,
+        installedItem: true,
+        assignedTechnician: true,
+      },
+    });
+    if (!ticket) return res.status(404).json({ error: 'Service ticket not found' });
+    res.json(formatTicketForResponse(ticket));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

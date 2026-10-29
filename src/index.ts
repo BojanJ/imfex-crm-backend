@@ -736,13 +736,22 @@ app.delete('/api/customers/:id', async (req, res) => {
   }
 });
 
-// Helper to format offer item specifications
+// Helper to format offer item specifications and serialize Decimal numbers
 const formatOfferForResponse = (offer: any) => {
   if (!offer) return offer;
   return {
     ...offer,
+    taxRate: Number(offer.taxRate || 0),
+    discountRate: Number(offer.discountRate || 0),
+    discountAmount: Number(offer.discountAmount || 0),
+    subtotal: Number(offer.subtotal || 0),
+    taxAmount: Number(offer.taxAmount || 0),
+    totalAmount: Number(offer.totalAmount || 0),
     items: (offer.items || []).map((item: any) => ({
       ...item,
+      quantity: Number(item.quantity || 1),
+      unitPrice: Number(item.unitPrice || 0),
+      totalPrice: Number(item.totalPrice || 0),
       specifications: (item.offerItemSpecifications || item.specifications || []).map((s: any) => ({
         specificationKeyId: s.specificationKeyId,
         specificationOptionId: s.specificationOptionId || undefined,

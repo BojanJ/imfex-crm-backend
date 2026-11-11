@@ -1,16 +1,15 @@
 import { PrismaClient } from '@prisma/client';
-import bcrypt from 'bcryptjs';
+import * as bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
 export async function seedDatabase() {
-  console.log('🌱 Starting IMFEX CRM Database Seeding (Macedonian)...');
+  console.log('🌱 Starting IMFEX CRM Minimal Database Seeding...');
 
   const adminPasswordHash = bcrypt.hashSync('admin123', 10);
-  const salesPasswordHash = bcrypt.hashSync('sales123', 10);
 
-  // 1. Seed Demo Profiles / Users
-  const superAdmin = await prisma.profile.upsert({
+  // Ensure only the Super Admin user is present (no demo/dummy records)
+  await prisma.profile.upsert({
     where: { email: 'admin@imfex.com' },
     update: {
       passwordHash: adminPasswordHash,
@@ -28,167 +27,7 @@ export async function seedDatabase() {
     },
   });
 
-  const salesUser = await prisma.profile.upsert({
-    where: { email: 'sales@imfex.com' },
-    update: {
-      passwordHash: salesPasswordHash,
-      mustChangePassword: false,
-      status: 'ACTIVE',
-    },
-    create: {
-      id: '22222222-2222-2222-2222-222222222222',
-      email: 'sales@imfex.com',
-      fullName: 'Менаџер за Продажба',
-      role: 'USER',
-      passwordHash: salesPasswordHash,
-      mustChangePassword: false,
-      status: 'ACTIVE',
-    },
-  });
-
-  console.log('✅ Profiles seeded with bcrypt password hashes: admin@imfex.com (admin123) & sales@imfex.com (sales123)');
-
-  // 2. Seed Products
-  const garageDoor = await prisma.product.upsert({
-    where: { code: 'PROD-GAR-01' },
-    update: {},
-    create: {
-      id: 'a1111111-1111-1111-1111-111111111111',
-      name: 'Сегментна Гаражна Врата',
-      code: 'PROD-GAR-01',
-      description: 'Двослојни топлински изолирани челични панели (40мм) со полиуретанско јадро.',
-      isActive: true,
-    },
-  });
-
-  const industrialWindow = await prisma.product.upsert({
-    where: { code: 'PROD-WIN-02' },
-    update: {},
-    create: {
-      id: 'a2222222-2222-2222-2222-222222222222',
-      name: 'Алуминиумски Архитектонски Прозорски Систем',
-      code: 'PROD-WIN-02',
-      description: 'Високоперформансен термалски изолиран алуминиумски профил.',
-      isActive: true,
-    },
-  });
-
-  const rollerShutter = await prisma.product.upsert({
-    where: { code: 'PROD-SHU-03' },
-    update: {},
-    create: {
-      id: 'a3333333-3333-3333-3333-333333333333',
-      name: 'Екструдирана Сигурносна Ролетна',
-      code: 'PROD-SHU-03',
-      description: 'Зајакната алуминиумска ролетна за комерцијална и станбена безбедност.',
-      isActive: true,
-    },
-  });
-
-  console.log('✅ Products seeded: Гаражна Врата, Прозорски Систем, Ролетна');
-
-  // 3. Seed Models & Spec Keys for Garage Door
-  let modelG1 = await prisma.productModel.findFirst({
-    where: { productId: garageDoor.id, name: 'ThermoPro 40 (40мм Изолација)' },
-  });
-  if (!modelG1) {
-    modelG1 = await prisma.productModel.create({
-      data: {
-        productId: garageDoor.id,
-        name: 'ThermoPro 40 (40мм Изолација)',
-        basePrice: 850.00,
-      },
-    });
-  }
-
-  // 4. Seed Customers
-  let customerCorp = await prisma.customer.findFirst({
-    where: { taxId: 'MK4030012345678' },
-  });
-  if (!customerCorp) {
-    customerCorp = await prisma.customer.create({
-      data: {
-        customerType: 'COMPANY',
-        name: 'Логистички Центар Скопје ДООЕЛ',
-        companyName: 'Логистички Центар Скопје ДООЕЛ',
-        taxId: 'MK4030012345678',
-        email: 'nabavki@logistika.mk',
-        phone: '+389 2 3123 456',
-        address: 'Ул. Индустриска бр. 42',
-        city: 'Скопје',
-        notes: 'Главен комерцијален клиент. Стандардно фактурирање со 18% ДДВ.',
-      },
-    });
-  }
-
-  console.log('✅ Customers seeded in Macedonian');
-
-  // 5. Seed Sample Offer (Idempotent Upsert)
-  const sampleOffer = await prisma.offer.upsert({
-    where: { offerNumber: 'OFF-2026-0001' },
-    update: {
-      createdByUserId: superAdmin.id,
-      customerId: customerCorp.id,
-    },
-    create: {
-      offerNumber: 'OFF-2026-0001',
-      customerId: customerCorp.id,
-      createdByUserId: superAdmin.id,
-      status: 'SENT',
-      taxRate: 18.00,
-      subtotal: 2540.00,
-      taxAmount: 457.20,
-      totalAmount: 2997.20,
-      validUntil: new Date('2026-08-30'),
-      items: {
-        create: [
-          {
-            serviceTypes: ['PRODUCT', 'INSTALLATION'],
-            productId: garageDoor.id,
-            productModelId: modelG1.id,
-            customTitle: 'Сегментна Гаражна Врата (Магацинска Врата 1)',
-            widthMm: 4000,
-            heightMm: 3000,
-            quantity: 2,
-            unitPrice: 1170.00,
-            totalPrice: 2340.00,
-          },
-          {
-            serviceTypes: ['SERVICE'],
-            customTitle: 'Годишен Сервисен Преглед и Пакет за Одржување на Мотор',
-            quantity: 1,
-            unitPrice: 200.00,
-            totalPrice: 200.00,
-          },
-        ],
-      },
-    },
-  });
-
-  console.log(`✅ Sample Offer Created/Updated: ${sampleOffer.offerNumber}`);
-
-  // 6. Seed Sample Calendar Event
-  const sampleMeeting = await prisma.calendarEvent.upsert({
-    where: { id: 'c1111111-1111-1111-1111-111111111111' },
-    update: {
-      customerId: customerCorp.id,
-    },
-    create: {
-      id: 'c1111111-1111-1111-1111-111111111111',
-      title: 'Теренски увид и премер - Логистички Центар',
-      description: 'Состанок за димензионирање на гаражни врати во нов објект',
-      startDate: new Date().toISOString().split('T')[0] + 'T10:00',
-      endDate: new Date().toISOString().split('T')[0] + 'T11:30',
-      allDay: false,
-      eventType: 'MEETING',
-      customerId: customerCorp.id,
-      location: 'Ул. Индустриска бр. 42, Скопје',
-      color: 'purple',
-    },
-  });
-
-  console.log(`✅ Sample Calendar Event Seeded: ${sampleMeeting.title}`);
-  console.log('🎉 Seeding finished successfully!');
+  console.log('✅ Minimal seed complete: admin@imfex.com (admin123)');
 }
 
 if (require.main === module) {

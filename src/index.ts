@@ -54,39 +54,6 @@ app.all('/api/admin/clean-database', async (req, res) => {
       await prisma.customer.delete({ where: { id: c.id } });
     }
 
-    let customerCorp = await prisma.customer.findFirst({ where: { taxId: 'MK4030012345678' } });
-    if (!customerCorp || customerCorp.name.includes('?')) {
-      customerCorp = await prisma.customer.create({
-        data: {
-          customerType: 'COMPANY',
-          name: 'Логистички Центар Скопје ДООЕЛ',
-          companyName: 'Логистички Центар Скопје ДООЕЛ',
-          taxId: 'MK4030012345678',
-          email: 'nabavki@logistika.mk',
-          phone: '+389 2 3123 456',
-          address: 'Ул. Индустриска бр. 42',
-          city: 'Скопје',
-          notes: 'Главен комерцијален клиент. Стандардно фактурирање со 18% ДДВ.',
-        },
-      });
-    }
-
-    let customerInd = await prisma.customer.findFirst({ where: { email: 'alex.stojanovski@gmail.com' } });
-    if (!customerInd || customerInd.name.includes('?')) {
-      customerInd = await prisma.customer.create({
-        data: {
-          customerType: 'INDIVIDUAL',
-          name: 'Александар Стојановски',
-          companyName: '',
-          email: 'alex.stojanovski@gmail.com',
-          phone: '+389 70 888 999',
-          address: 'Ул. Партизански Одреди 74',
-          city: 'Скопје',
-          notes: 'Редовен индивидуален купувач.',
-        },
-      });
-    }
-
     res.json({
       success: true,
       message: 'Database cleaned and verified with clean UTF-8 records.',
@@ -97,9 +64,10 @@ app.all('/api/admin/clean-database', async (req, res) => {
   }
 });
 
-// Admin Fresh Database Wipe Endpoint (0 records, 2 System Users)
+// Admin Fresh Database Wipe Endpoint (0 records, 1 System User)
 app.all('/api/admin/reset-database', async (req, res) => {
   try {
+    await prisma.offerItemSpecification.deleteMany();
     await prisma.offerItem.deleteMany();
     await prisma.offer.deleteMany();
     await prisma.project.deleteMany();
@@ -112,15 +80,15 @@ app.all('/api/admin/reset-database', async (req, res) => {
     await prisma.specificationKey.deleteMany();
     await prisma.productModel.deleteMany();
     await prisma.product.deleteMany();
+    await prisma.productCategory.deleteMany();
 
     await prisma.profile.deleteMany({
       where: {
-        email: { notIn: ['admin@imfex.com', 'sales@imfex.com'] },
+        email: { notIn: ['admin@imfex.com'] },
       },
     });
 
     const adminPasswordHash = bcrypt.hashSync('admin123', 10);
-    const salesPasswordHash = bcrypt.hashSync('sales123', 10);
 
     await prisma.profile.upsert({
       where: { email: 'admin@imfex.com' },
@@ -140,27 +108,9 @@ app.all('/api/admin/reset-database', async (req, res) => {
       },
     });
 
-    await prisma.profile.upsert({
-      where: { email: 'sales@imfex.com' },
-      update: {
-        passwordHash: salesPasswordHash,
-        mustChangePassword: false,
-        status: 'ACTIVE',
-      },
-      create: {
-        id: '22222222-2222-2222-2222-222222222222',
-        email: 'sales@imfex.com',
-        fullName: 'Менаџер за Продажба',
-        role: 'USER',
-        passwordHash: salesPasswordHash,
-        mustChangePassword: false,
-        status: 'ACTIVE',
-      },
-    });
-
     res.json({
       success: true,
-      message: 'Database reset cleanly to fresh state. 0 records, 2 system users active (admin@imfex.com & sales@imfex.com).',
+      message: 'Database reset cleanly to fresh state. 0 records, 1 system user active (admin@imfex.com).',
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

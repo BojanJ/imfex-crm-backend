@@ -13,10 +13,10 @@ const resendApiKey = process.env.RESEND_API_KEY || '';
 const resend = resendApiKey ? new Resend(resendApiKey) : null;
 const EMAIL_FROM = process.env.EMAIL_FROM || 'IMFEX CRM <onboarding@resend.dev>';
 
-// Support payload up to 10MB for PDF base64 attachments
+// Support payload up to 20MB for PDF/image/office base64 attachments
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
 // Automatically ensure new columns exist in PostgreSQL on startup
 async function ensureSchemaColumns() {
@@ -35,6 +35,12 @@ async function ensureSchemaColumns() {
     );
     await prisma.$executeRawUnsafe(
       `ALTER TABLE offer_item_specifications ADD COLUMN IF NOT EXISTS custom_price_modifier DECIMAL(10, 2) DEFAULT 0.00;`
+    );
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE client_documents ADD COLUMN IF NOT EXISTS file_name TEXT;`
+    );
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE client_documents ADD COLUMN IF NOT EXISTS size_bytes INTEGER;`
     );
   } catch (err: any) {
     console.warn('Auto schema evolution notice:', err?.message || err);
@@ -1055,6 +1061,7 @@ app.get('/api/projects', async (req, res) => {
         offer: true,
         responsibleUser: true,
         installedItems: true,
+        documents: true,
       },
     });
     res.json(projects);
@@ -1072,6 +1079,7 @@ app.get('/api/projects/:id', async (req, res) => {
         offer: true,
         responsibleUser: true,
         installedItems: true,
+        documents: true,
       },
     });
     if (!project) return res.status(404).json({ error: 'Project not found' });
@@ -1396,14 +1404,35 @@ app.get('/api/client-documents', async (req, res) => {
 
 app.post('/api/client-documents', async (req, res) => {
   try {
-    const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl } = req.body;
+    const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl, fileName, sizeBytes } = req.body;
     const isUuid = (val?: string | null) =>
       Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
+
+    let validProjectId: string | null = null;
+    let resolvedProject: { id: string; customerId: string; offerId: string } | null = null;
+    if (projectId) {
+      if (isUuid(projectId)) {
+        resolvedProject = await prisma.project
+          .findUnique({ where: { id: projectId }, select: { id: true, customerId: true, offerId: true } })
+          .catch(() => null);
+      }
+      if (!resolvedProject) {
+        resolvedProject = await prisma.project
+          .findUnique({ where: { projectNumber: String(projectId) }, select: { id: true, customerId: true, offerId: true } })
+          .catch(() => null);
+      }
+      if (resolvedProject) {
+        validProjectId = resolvedProject.id;
+      }
+    }
 
     let validCustomerId = isUuid(customerId) ? customerId : null;
     if (validCustomerId) {
       const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
       if (!custExists) validCustomerId = null;
+    }
+    if (!validCustomerId && resolvedProject?.customerId) {
+      validCustomerId = resolvedProject.customerId;
     }
     if (!validCustomerId) {
       const firstCust = await prisma.customer.findFirst();
@@ -1415,9 +1444,29 @@ app.post('/api/client-documents', async (req, res) => {
       }
     }
 
-    const validOfferId = isUuid(offerId) ? offerId : null;
-    const validProjectId = isUuid(projectId) ? projectId : null;
-    const validServiceId = isUuid(serviceId) ? serviceId : null;
+    let validOfferId: string | null = null;
+    if (isUuid(offerId)) {
+      const offExists = await prisma.offer.findUnique({ where: { id: offerId }, select: { id: true } }).catch(() => null);
+      if (offExists) validOfferId = offExists.id;
+    } else if (offerId) {
+      const offByNum = await prisma.offer
+        .findUnique({ where: { offerNumber: String(offerId) }, select: { id: true } })
+        .catch(() => null);
+      if (offByNum) validOfferId = offByNum.id;
+    }
+    if (!validOfferId && resolvedProject?.offerId) {
+      validOfferId = resolvedProject.offerId;
+    }
+
+    let validServiceId: string | null = null;
+    if (isUuid(serviceId)) {
+      const srvExists = await prisma.serviceTicket
+        .findUnique({ where: { id: serviceId }, select: { id: true } })
+        .catch(() => null);
+      if (srvExists) validServiceId = srvExists.id;
+    }
+
+    const parsedSize = sizeBytes !== undefined && sizeBytes !== null && !Number.isNaN(Number(sizeBytes)) ? Number(sizeBytes) : null;
 
     let doc;
     if (isUuid(id)) {
@@ -1427,6 +1476,8 @@ app.post('/api/client-documents', async (req, res) => {
           title: title || 'Документ',
           fileType: fileType || 'application/pdf',
           fileUrl: fileUrl || '',
+          fileName: fileName || null,
+          sizeBytes: parsedSize,
           offerId: validOfferId,
           projectId: validProjectId,
           serviceId: validServiceId,
@@ -1440,20 +1491,49 @@ app.post('/api/client-documents', async (req, res) => {
           title: title || 'Документ',
           fileType: fileType || 'application/pdf',
           fileUrl: fileUrl || '',
+          fileName: fileName || null,
+          sizeBytes: parsedSize,
         },
       });
     } else {
-      doc = await prisma.clientDocument.create({
-        data: {
-          customerId: validCustomerId,
-          offerId: validOfferId,
-          projectId: validProjectId,
-          serviceId: validServiceId,
-          title: title || 'Документ',
-          fileType: fileType || 'application/pdf',
-          fileUrl: fileUrl || '',
-        },
-      });
+      const existingDoc = await prisma.clientDocument
+        .findFirst({
+          where: {
+            title: title || 'Документ',
+            ...(validProjectId ? { projectId: validProjectId } : { customerId: validCustomerId }),
+          },
+        })
+        .catch(() => null);
+
+      if (existingDoc) {
+        doc = await prisma.clientDocument.update({
+          where: { id: existingDoc.id },
+          data: {
+            title: title || 'Документ',
+            fileType: fileType || existingDoc.fileType || 'application/pdf',
+            fileUrl: fileUrl || existingDoc.fileUrl || '',
+            fileName: fileName ?? existingDoc.fileName ?? null,
+            sizeBytes: parsedSize ?? existingDoc.sizeBytes ?? null,
+            offerId: validOfferId ?? existingDoc.offerId,
+            projectId: validProjectId ?? existingDoc.projectId,
+            serviceId: validServiceId ?? existingDoc.serviceId,
+          },
+        });
+      } else {
+        doc = await prisma.clientDocument.create({
+          data: {
+            customerId: validCustomerId,
+            offerId: validOfferId,
+            projectId: validProjectId,
+            serviceId: validServiceId,
+            title: title || 'Документ',
+            fileType: fileType || 'application/pdf',
+            fileUrl: fileUrl || '',
+            fileName: fileName || null,
+            sizeBytes: parsedSize,
+          },
+        });
+      }
     }
     res.json(doc);
   } catch (error: any) {

@@ -122,6 +122,7 @@ model SpecificationKey {
   product                 Product                  @relation(fields: [productId], references: [id], onDelete: Cascade)
   name                    String
   inputType               SpecInputType            @default(SELECT) @map("input_type")
+  defaultValue            String?                  @map("default_value")
   createdAt               DateTime                 @default(now()) @map("created_at")
   options                 SpecificationOption[]
   offerItemSpecifications OfferItemSpecification[]
@@ -135,6 +136,7 @@ model SpecificationOption {
   specificationKey        SpecificationKey         @relation(fields: [specificationKeyId], references: [id], onDelete: Cascade)
   label                   String
   priceModifier           Decimal                  @default(0.00) @map("price_modifier") @db.Decimal(10, 2)
+  isDefault               Boolean                  @default(false) @map("is_default")
   createdAt               DateTime                 @default(now()) @map("created_at")
   offerItemSpecifications OfferItemSpecification[]
 
@@ -211,11 +213,13 @@ model OfferItemSpecification {
   id                    String               @id @default(uuid()) @db.Uuid
   offerItemId           String               @map("offer_item_id") @db.Uuid
   offerItem             OfferItem            @relation(fields: [offerItemId], references: [id], onDelete: Cascade)
-  specificationKeyId    String               @map("specification_key_id") @db.Uuid
-  specificationKey      SpecificationKey     @relation(fields: [specificationKeyId], references: [id], onDelete: Cascade)
+  specificationKeyId    String?              @map("specification_key_id") @db.Uuid
+  specificationKey      SpecificationKey?    @relation(fields: [specificationKeyId], references: [id], onDelete: Cascade)
   specificationOptionId String?              @map("specification_option_id") @db.Uuid
   specificationOption   SpecificationOption? @relation(fields: [specificationOptionId], references: [id], onDelete: Cascade)
   customValue           String?              @map("custom_value")
+  customKeyName         String?              @map("custom_key_name")
+  customPriceModifier   Decimal?             @default(0.00) @map("custom_price_modifier") @db.Decimal(10, 2)
   createdAt             DateTime             @default(now()) @map("created_at")
 
   @@map("offer_item_specifications")

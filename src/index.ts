@@ -18,6 +18,30 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
+// Automatically ensure new columns exist in PostgreSQL on startup
+async function ensureSchemaColumns() {
+  try {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE specification_keys ADD COLUMN IF NOT EXISTS default_value TEXT;`
+    );
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE specification_options ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE;`
+    );
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE offer_item_specifications ALTER COLUMN specification_key_id DROP NOT NULL;`
+    );
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE offer_item_specifications ADD COLUMN IF NOT EXISTS custom_key_name TEXT;`
+    );
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE offer_item_specifications ADD COLUMN IF NOT EXISTS custom_price_modifier DECIMAL(10, 2) DEFAULT 0.00;`
+    );
+  } catch (err: any) {
+    console.warn('Auto schema evolution notice:', err?.message || err);
+  }
+}
+ensureSchemaColumns();
+
 // Health Check Endpoint for Render
 app.get('/health', (req, res) => {
   res.json({
@@ -557,59 +581,132 @@ app.post('/api/products', async (req, res) => {
     }
 
     if (Array.isArray(models)) {
+      const keptModelIds: string[] = [];
       for (const m of models) {
         if (m.name) {
-          const existingModel = await prisma.productModel.findFirst({
-            where: { productId: product.id, name: m.name },
-          });
+          const isModelUuid = m.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(m.id);
+          let existingModel = isModelUuid
+            ? await prisma.productModel.findUnique({ where: { id: m.id } }).catch(() => null)
+            : null;
           if (!existingModel) {
-            await prisma.productModel.create({
+            existingModel = await prisma.productModel.findFirst({
+              where: { productId: product.id, name: m.name },
+            });
+          }
+          if (existingModel) {
+            const updatedMod = await prisma.productModel.update({
+              where: { id: existingModel.id },
+              data: {
+                name: m.name,
+                basePrice: m.basePrice !== undefined ? Number(m.basePrice) : existingModel.basePrice,
+              },
+            });
+            keptModelIds.push(updatedMod.id);
+          } else {
+            const createdMod = await prisma.productModel.create({
               data: {
                 productId: product.id,
                 name: m.name,
                 basePrice: m.basePrice || 0,
               },
             });
+            keptModelIds.push(createdMod.id);
           }
         }
       }
+      await prisma.productModel.deleteMany({
+        where: {
+          productId: product.id,
+          id: { notIn: keptModelIds },
+        },
+      });
     }
 
     if (Array.isArray(specificationKeys)) {
+      const keptKeyIds: string[] = [];
       for (const sk of specificationKeys) {
         if (sk.name) {
-          let specKey = await prisma.specificationKey.findFirst({
-            where: { productId: product.id, name: sk.name },
-          });
+          const isKeyUuid = sk.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sk.id);
+          let specKey = isKeyUuid
+            ? await prisma.specificationKey.findUnique({ where: { id: sk.id } }).catch(() => null)
+            : null;
+          if (!specKey) {
+            specKey = await prisma.specificationKey.findFirst({
+              where: { productId: product.id, name: sk.name },
+            });
+          }
           if (!specKey) {
             specKey = await prisma.specificationKey.create({
               data: {
                 productId: product.id,
                 name: sk.name,
                 inputType: sk.inputType || 'SELECT',
+                defaultValue: sk.defaultValue || null,
+              },
+            });
+          } else {
+            specKey = await prisma.specificationKey.update({
+              where: { id: specKey.id },
+              data: {
+                name: sk.name,
+                inputType: sk.inputType || specKey.inputType,
+                defaultValue: sk.defaultValue !== undefined ? sk.defaultValue || null : specKey.defaultValue,
               },
             });
           }
+          keptKeyIds.push(specKey.id);
+
           if (Array.isArray(sk.options)) {
+            const keptOptIds: string[] = [];
             for (const opt of sk.options) {
               if (opt.label) {
-                const existingOpt = await prisma.specificationOption.findFirst({
-                  where: { specificationKeyId: specKey.id, label: opt.label },
-                });
+                const isOptUuid = opt.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(opt.id);
+                let existingOpt = isOptUuid
+                  ? await prisma.specificationOption.findUnique({ where: { id: opt.id } }).catch(() => null)
+                  : null;
                 if (!existingOpt) {
-                  await prisma.specificationOption.create({
+                  existingOpt = await prisma.specificationOption.findFirst({
+                    where: { specificationKeyId: specKey.id, label: opt.label },
+                  });
+                }
+                if (!existingOpt) {
+                  const createdOpt = await prisma.specificationOption.create({
                     data: {
                       specificationKeyId: specKey.id,
                       label: opt.label,
                       priceModifier: opt.priceModifier || 0,
+                      isDefault: Boolean(opt.isDefault),
                     },
                   });
+                  keptOptIds.push(createdOpt.id);
+                } else {
+                  const updatedOpt = await prisma.specificationOption.update({
+                    where: { id: existingOpt.id },
+                    data: {
+                      label: opt.label,
+                      priceModifier: opt.priceModifier !== undefined ? Number(opt.priceModifier) : existingOpt.priceModifier,
+                      isDefault: opt.isDefault !== undefined ? Boolean(opt.isDefault) : existingOpt.isDefault,
+                    },
+                  });
+                  keptOptIds.push(updatedOpt.id);
                 }
               }
             }
+            await prisma.specificationOption.deleteMany({
+              where: {
+                specificationKeyId: specKey.id,
+                id: { notIn: keptOptIds },
+              },
+            });
           }
         }
       }
+      await prisma.specificationKey.deleteMany({
+        where: {
+          productId: product.id,
+          id: { notIn: keptKeyIds },
+        },
+      });
     }
 
     const updatedProduct = await prisma.product.findUnique({
@@ -703,9 +800,11 @@ const formatOfferForResponse = (offer: any) => {
       unitPrice: Number(item.unitPrice || 0),
       totalPrice: Number(item.totalPrice || 0),
       specifications: (item.offerItemSpecifications || item.specifications || []).map((s: any) => ({
-        specificationKeyId: s.specificationKeyId,
+        specificationKeyId: s.specificationKeyId || `custom-${s.id}`,
         specificationOptionId: s.specificationOptionId || undefined,
         customValue: s.customValue || undefined,
+        customKeyName: s.customKeyName || undefined,
+        customPriceModifier: s.customPriceModifier !== undefined && s.customPriceModifier !== null ? Number(s.customPriceModifier) : undefined,
       })),
     })),
   };
@@ -896,9 +995,22 @@ app.post('/api/offers', async (req, res) => {
                   specificationKeyId: spec.specificationKeyId,
                   specificationOptionId: validOptId,
                   customValue: spec.customValue || null,
+                  customKeyName: spec.customKeyName || null,
+                  customPriceModifier: spec.customPriceModifier ? Number(spec.customPriceModifier) : 0,
                 },
               }).catch((e) => console.warn('Skipping offerItemSpecification insert warning:', e?.message || e));
             }
+          } else if (spec.customKeyName || spec.customValue) {
+            await prisma.offerItemSpecification.create({
+              data: {
+                offerItemId: createdItem.id,
+                specificationKeyId: null,
+                specificationOptionId: null,
+                customValue: spec.customValue || null,
+                customKeyName: spec.customKeyName || 'Прилагодена спецификација',
+                customPriceModifier: spec.customPriceModifier ? Number(spec.customPriceModifier) : 0,
+              },
+            }).catch((e) => console.warn('Skipping custom offerItemSpecification insert warning:', e?.message || e));
           }
         }
       }

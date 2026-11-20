@@ -11,21 +11,60 @@ import {
   signAuthToken,
   stripPasswordHash,
 } from './auth';
+import {
+  escapeHtml,
+  isValidEmail,
+  generateSecureTempPassword,
+  securityHeaders,
+  createRateLimiter,
+  buildCorsOptions,
+  validateDocumentUpload,
+} from './security';
 
 const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 4000;
 const requireAuth = createRequireAuth(prisma);
 
+const loginLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  keyPrefix: 'login',
+  message: 'Too many login attempts. Please wait 15 minutes and try again.',
+});
+const emailLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  keyPrefix: 'email',
+  message: 'Email rate limit exceeded. Please try again shortly.',
+});
+const passwordLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyPrefix: 'password',
+  message: 'Too many password change attempts. Please wait and try again.',
+});
+
 // Initialize Resend Email Service
 const resendApiKey = process.env.RESEND_API_KEY || '';
 const resend = resendApiKey ? new Resend(resendApiKey) : null;
 const EMAIL_FROM = process.env.EMAIL_FROM || 'IMFEX CRM <onboarding@resend.dev>';
 
-// Support payload up to 20MB for PDF/image/office base64 attachments
-app.use(cors());
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(securityHeaders);
+app.use(cors(buildCorsOptions()));
+
+// Keep global body limit tight (1mb); allow 15mb only on PDF email & document upload routes
+const standardJson = express.json({ limit: '1mb' });
+const largeJson = express.json({ limit: '15mb' });
+app.use((req, res, next) => {
+  if (req.path === '/api/email/send-offer' || req.path === '/api/client-documents') {
+    return largeJson(req, res, next);
+  }
+  return standardJson(req, res, next);
+});
+app.use(express.urlencoded({ limit: '1mb', extended: true }));
 
 // Automatically ensure new columns exist in PostgreSQL on startup
 async function ensureSchemaColumns() {
@@ -80,7 +119,7 @@ app.get('/', (req, res) => {
 // PUBLIC AUTHENTICATION ENDPOINT
 // ==========================================
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body ?? {};
     const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
@@ -122,6 +161,44 @@ app.use('/api', requireAuth);
 // Verify current authenticated session
 app.get('/api/auth/me', (req: AuthenticatedRequest, res) => {
   res.json({ user: req.user });
+});
+
+// Change current user's password (verifies currentPassword, clears mustChangePassword)
+app.post('/api/auth/change-password', passwordLimiter, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body ?? {};
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current password and new password are required.' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters long.' });
+    }
+    if (newPassword === currentPassword) {
+      return res.status(400).json({ error: 'New password must be different from your current password.' });
+    }
+
+    const user = await prisma.profile.findUnique({ where: { id: req.user!.id } });
+    if (!user || !user.passwordHash) {
+      return res.status(401).json({ error: 'Account not found.' });
+    }
+
+    const matches = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!matches) {
+      return res.status(401).json({ error: 'Current password is incorrect.' });
+    }
+
+    const nextHash = await bcrypt.hash(newPassword, 10);
+    const updated = await prisma.profile.update({
+      where: { id: user.id },
+      data: { passwordHash: nextHash, mustChangePassword: false },
+      select: SAFE_PROFILE_SELECT,
+    });
+
+    res.json({ success: true, user: updated });
+  } catch (error: any) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: 'Failed to change password.' });
+  }
 });
 
 // ==========================================
@@ -236,13 +313,13 @@ app.post('/api/admin/reset-database', requireRole('SUPER_ADMIN'), async (req: Au
 // EMAIL TRANSACTIONAL API ENDPOINTS
 // ==========================================
 
-// 1. Send Offer PDF to Customer
-app.post('/api/email/send-offer', async (req, res) => {
+// 1. Send Offer PDF to Customer (authenticated, rate-limited, HTML-escaped)
+app.post('/api/email/send-offer', emailLimiter, async (req, res) => {
   try {
-    const { to, customerName, offerNumber, totalAmount, pdfBase64, customMessage } = req.body;
+    const { to, customerName, offerNumber, totalAmount, pdfBase64, customMessage } = req.body ?? {};
 
-    if (!to) {
-      return res.status(400).json({ error: 'Recipient email address (to) is required.' });
+    if (!isValidEmail(to)) {
+      return res.status(400).json({ error: 'A valid recipient email address (to) is required.' });
     }
 
     if (!resend) {
@@ -251,13 +328,22 @@ app.post('/api/email/send-offer', async (req, res) => {
       });
     }
 
+    const safeOfferNumber = escapeHtml(offerNumber || '');
+    const safeCustomerName = escapeHtml(customerName || 'Клиент');
+    const safeCustomMessage = customMessage ? escapeHtml(customMessage) : '';
+    const safeAmount = Number.isFinite(Number(totalAmount)) ? Number(totalAmount).toFixed(2) : '0.00';
+    const cleanFilename = String(offerNumber || 'Offer').replace(/[^a-zA-Z0-9_-]/g, '_');
+
     let attachments: { filename: string; content: Buffer }[] = [];
     if (pdfBase64) {
       const cleanBase64 = String(pdfBase64).replace(/^data:.*?;base64,/, '').trim();
       const pdfBuffer = Buffer.from(cleanBase64, 'base64');
+      if (!pdfBuffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
+        return res.status(400).json({ error: 'Invalid PDF attachment.' });
+      }
       attachments = [
         {
-          filename: `${offerNumber || 'Offer'}.pdf`,
+          filename: `${cleanFilename}.pdf`,
           content: pdfBuffer,
         },
       ];
@@ -269,19 +355,19 @@ app.post('/api/email/send-offer', async (req, res) => {
           <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">
             ИМФЕКС ЕКСПОРТ-ИМПОРТ ДООЕЛ
           </h1>
-          <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 12px;">Комерцијална Понуда • ${offerNumber || ''}</p>
+          <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 12px;">Комерцијална Понуда • ${safeOfferNumber}</p>
         </div>
 
         <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px; background-color: #ffffff;">
-          <p style="font-size: 14px; font-weight: 700; color: #0f172a;">Почитувани ${customerName || 'Клиент'},</p>
+          <p style="font-size: 14px; font-weight: 700; color: #0f172a;">Почитувани ${safeCustomerName},</p>
           <p style="font-size: 13px; color: #334155;">
-            Во прилог на оваа порака Ви ја испраќаме официјалната комерцијална понуда <strong>${offerNumber || ''}</strong> со вкупен износ од <strong>€${Number(totalAmount || 0).toFixed(2)}</strong>.
+            Во прилог на оваа порака Ви ја испраќаме официјалната комерцијална понуда <strong>${safeOfferNumber}</strong> со вкупен износ од <strong>€${safeAmount}</strong>.
           </p>
 
           ${
-            customMessage
-              ? `<div style="background-color: #f8fafc; border-left: 4px solid #2563eb; padding: 12px; margin: 16px 0; font-size: 12px; color: #475569; font-style: italic;">
-                  "${customMessage}"
+            safeCustomMessage
+              ? `<div style="background-color: #f8fafc; border-left: 4px solid #2563eb; padding: 12px; margin: 16px 0; font-size: 12px; color: #475569; font-style: italic; white-space: pre-wrap;">
+                  "${safeCustomMessage}"
                 </div>`
               : ''
           }
@@ -300,8 +386,8 @@ app.post('/api/email/send-offer', async (req, res) => {
 
     const result = await resend.emails.send({
       from: EMAIL_FROM,
-      to: [to],
-      subject: `Комерцијална Понуда ${offerNumber || ''} - ИМФЕКС ЕКСПОРТ-ИМПОРТ`,
+      to: [String(to).trim()],
+      subject: `Комерцијална Понуда ${String(offerNumber || '').replace(/[\r\n]/g, '')} - ИМФЕКС ЕКСПОРТ-ИМПОРТ`,
       html: htmlContent,
       attachments,
     });
@@ -313,122 +399,7 @@ app.post('/api/email/send-offer', async (req, res) => {
     res.json({ success: true, id: result.data?.id });
   } catch (error: any) {
     console.error('Send offer email error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 2. Send Welcome & Temporary Password Email to New User
-app.post('/api/email/welcome-user', requireRole('SUPER_ADMIN'), async (req, res) => {
-  try {
-    const { to, fullName, tempPassword, role } = req.body;
-
-    if (!to || !fullName) {
-      return res.status(400).json({ error: 'Recipient email and full name are required.' });
-    }
-
-    if (!resend) {
-      return res.status(503).json({
-        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables.',
-      });
-    }
-
-    const htmlContent = `
-      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
-        <div style="background-color: #0f172a; padding: 24px; text-align: center; border-radius: 12px 12px 0 0;">
-          <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 800;">
-            Добредојдовте во IMFEX Enterprise CRM
-          </h1>
-        </div>
-
-        <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px; background-color: #ffffff;">
-          <p style="font-size: 14px; font-weight: 700;">Здраво ${fullName},</p>
-          <p style="font-size: 13px;">
-            Креиран е нов кориснички сметка за Вес на платформата за управување со клиенти и понуди на <strong>ИМФЕКС</strong>.
-          </p>
-
-          <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; margin: 16px 0; font-size: 13px;">
-            <p style="margin: 0 0 8px 0;"><strong>Е-пошта:</strong> ${to}</p>
-            <p style="margin: 0 0 8px 0;"><strong>Привремена лозинка:</strong> <span style="font-family: monospace; font-size: 14px; color: #2563eb; font-weight: 700;">${tempPassword || 'IMFEX123!'}</span></p>
-            <p style="margin: 0;"><strong>Улога:</strong> ${role || 'Корисник'}</p>
-          </div>
-
-          <p style="font-size: 12px; color: #64748b;">
-            При првата најава, ќе биде побарано да ја промените вашата привремена лозинка за безбедност.
-          </p>
-        </div>
-      </div>
-    `;
-
-    const result = await resend.emails.send({
-      from: EMAIL_FROM,
-      to: [to],
-      subject: `Добредојдовте во IMFEX Enterprise CRM - Податоци за најава`,
-      html: htmlContent,
-    });
-
-    if (result.error) {
-      return res.status(400).json({ error: result.error.message });
-    }
-
-    res.json({ success: true, id: result.data?.id });
-  } catch (error: any) {
-    console.error('Send welcome email error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3. Send Password Reset Email
-app.post('/api/email/reset-password', requireRole('SUPER_ADMIN'), async (req, res) => {
-  try {
-    const { to, tempPassword } = req.body;
-
-    if (!to) {
-      return res.status(400).json({ error: 'Recipient email is required.' });
-    }
-
-    if (!resend) {
-      return res.status(503).json({
-        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables.',
-      });
-    }
-
-    const htmlContent = `
-      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
-        <div style="background-color: #0f172a; padding: 24px; text-align: center; border-radius: 12px 12px 0 0;">
-          <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 800;">
-            Ресетирање на Лозинка • IMFEX CRM
-          </h1>
-        </div>
-
-        <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px; background-color: #ffffff;">
-          <p style="font-size: 14px;">Побарано е ресетирање на вашата лозинка за IMFEX CRM.</p>
-
-          <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; margin: 16px 0; font-size: 13px;">
-            <p style="margin: 0;"><strong>Вашата нова привремена лозинка е:</strong> <span style="font-family: monospace; font-size: 14px; color: #dc2626; font-weight: 700;">${tempPassword || 'TempPass2026!'}</span></p>
-          </div>
-
-          <p style="font-size: 12px; color: #64748b;">
-            Ве молиме најавете се со оваа лозинка и веднаш променете ја во Нагодувања.
-          </p>
-        </div>
-      </div>
-    `;
-
-    const result = await resend.emails.send({
-      from: EMAIL_FROM,
-      to: [to],
-      subject: `Ресетирање на лозинка - IMFEX Enterprise CRM`,
-      html: htmlContent,
-    });
-
-    if (result.error) {
-      return res.status(400).json({ error: result.error.message });
-    }
-
-    res.json({ success: true, id: result.data?.id });
-  } catch (error: any) {
-    console.error('Send reset password email error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Failed to send email.' });
   }
 });
 
@@ -450,11 +421,15 @@ app.get('/api/profiles', async (req, res) => {
 
 app.post('/api/profiles', requireRole('SUPER_ADMIN'), async (req, res) => {
   try {
-    const { email, fullName, role, password } = req.body;
-    if (!email || typeof email !== 'string') {
+    const { email, fullName, role, password } = req.body ?? {};
+    if (!isValidEmail(email)) {
       return res.status(400).json({ error: 'Valid email is required' });
     }
-    const passwordHash = password ? bcrypt.hashSync(password, 10) : bcrypt.hashSync('IMFEX2026!', 10);
+    const rawPassword =
+      typeof password === 'string' && password.trim().length >= 8
+        ? password.trim()
+        : generateSecureTempPassword(12);
+    const passwordHash = await bcrypt.hash(rawPassword, 10);
     const profile = await prisma.profile.upsert({
       where: { email: email.trim().toLowerCase() },
       update: { fullName, role, status: 'ACTIVE' },
@@ -484,7 +459,7 @@ app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
       return res.status(403).json({ error: 'Insufficient permissions' });
     }
 
-    const { fullName, role, status, password } = req.body;
+    const { fullName, role, status, password, mustChangePassword } = req.body ?? {};
     const updateData: any = {};
     if (fullName !== undefined) updateData.fullName = fullName;
     if (isSuperAdmin) {
@@ -493,9 +468,19 @@ app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
     } else if (role !== undefined || status !== undefined) {
       return res.status(403).json({ error: 'Only SUPER_ADMIN can modify role or status' });
     }
-    if (password) {
-      updateData.passwordHash = bcrypt.hashSync(password, 10);
-      updateData.mustChangePassword = false;
+    if (typeof password === 'string' && password.length > 0) {
+      if (password.length < 8) {
+        return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
+      }
+      updateData.passwordHash = await bcrypt.hash(password, 10);
+      // Admin resetting another user's password defaults to mustChangePassword = true
+      if (isSuperAdmin && !isSelf) {
+        updateData.mustChangePassword = mustChangePassword !== undefined ? Boolean(mustChangePassword) : true;
+      } else {
+        updateData.mustChangePassword = false;
+      }
+    } else if (isSuperAdmin && mustChangePassword !== undefined) {
+      updateData.mustChangePassword = Boolean(mustChangePassword);
     }
 
     const profile = await prisma.profile.update({
@@ -1580,6 +1565,12 @@ app.get('/api/client-documents', async (req, res) => {
 app.post('/api/client-documents', async (req, res) => {
   try {
     const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl, fileName, sizeBytes } = req.body;
+
+    const uploadValidation = validateDocumentUpload(fileUrl, fileName || title);
+    if (!uploadValidation.ok) {
+      return res.status(400).json({ error: uploadValidation.error });
+    }
+
     const isUuid = (val?: string | null) =>
       Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
 

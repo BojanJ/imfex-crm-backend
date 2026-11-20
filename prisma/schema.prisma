@@ -84,6 +84,7 @@ model ProductCategory {
   createdAt DateTime          @default(now()) @map("created_at")
   products  Product[]
 
+  @@index([parentId])
   @@map("product_categories")
 }
 
@@ -105,6 +106,8 @@ model Product {
   offerItems        OfferItem[]
   installedItems    InstalledItem[]
 
+  @@index([categoryId])
+  @@index([isActive])
   @@map("products")
 }
 
@@ -117,6 +120,7 @@ model ProductModel {
   createdAt  DateTime    @default(now()) @map("created_at")
   offerItems OfferItem[]
 
+  @@index([productId])
   @@map("product_models")
 }
 
@@ -131,6 +135,7 @@ model SpecificationKey {
   options                 SpecificationOption[]
   offerItemSpecifications OfferItemSpecification[]
 
+  @@index([productId])
   @@map("specification_keys")
 }
 
@@ -144,6 +149,7 @@ model SpecificationOption {
   createdAt               DateTime                 @default(now()) @map("created_at")
   offerItemSpecifications OfferItemSpecification[]
 
+  @@index([specificationKeyId])
   @@map("specification_options")
 }
 
@@ -173,7 +179,7 @@ model Offer {
   id              String      @id @default(uuid()) @db.Uuid
   offerNumber     String      @unique @map("offer_number")
   customerId      String      @map("customer_id") @db.Uuid
-  customer        Customer    @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer        Customer    @relation(fields: [customerId], references: [id], onDelete: Restrict)
   createdByUserId String?     @map("created_by_user_id") @db.Uuid
   createdByUser   Profile?    @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
   status          OfferStatus @default(DRAFT)
@@ -189,6 +195,9 @@ model Offer {
   project         Project?
   documents       ClientDocument[]
 
+  @@index([customerId])
+  @@index([status])
+  @@index([createdByUserId])
   @@map("offers")
 }
 
@@ -210,6 +219,8 @@ model OfferItem {
   createdAt               DateTime                 @default(now()) @map("created_at")
   offerItemSpecifications OfferItemSpecification[]
 
+  @@index([offerId])
+  @@index([productId])
   @@map("offer_items")
 }
 
@@ -218,14 +229,17 @@ model OfferItemSpecification {
   offerItemId           String               @map("offer_item_id") @db.Uuid
   offerItem             OfferItem            @relation(fields: [offerItemId], references: [id], onDelete: Cascade)
   specificationKeyId    String?              @map("specification_key_id") @db.Uuid
-  specificationKey      SpecificationKey?    @relation(fields: [specificationKeyId], references: [id], onDelete: Cascade)
+  specificationKey      SpecificationKey?    @relation(fields: [specificationKeyId], references: [id], onDelete: SetNull)
   specificationOptionId String?              @map("specification_option_id") @db.Uuid
-  specificationOption   SpecificationOption? @relation(fields: [specificationOptionId], references: [id], onDelete: Cascade)
+  specificationOption   SpecificationOption? @relation(fields: [specificationOptionId], references: [id], onDelete: SetNull)
   customValue           String?              @map("custom_value")
   customKeyName         String?              @map("custom_key_name")
   customPriceModifier   Decimal?             @default(0.00) @map("custom_price_modifier") @db.Decimal(10, 2)
   createdAt             DateTime             @default(now()) @map("created_at")
 
+  @@index([offerItemId])
+  @@index([specificationKeyId])
+  @@index([specificationOptionId])
   @@map("offer_item_specifications")
 }
 
@@ -233,9 +247,9 @@ model Project {
   id                   String        @id @default(uuid()) @db.Uuid
   projectNumber        String        @unique @map("project_number")
   offerId              String        @unique @map("offer_id") @db.Uuid
-  offer                Offer         @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  offer                Offer         @relation(fields: [offerId], references: [id], onDelete: Restrict)
   customerId           String        @map("customer_id") @db.Uuid
-  customer             Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer             Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
   responsibleUserId    String?       @map("responsible_user_id") @db.Uuid
   responsibleUser      Profile?      @relation("ProjectResponsible", fields: [responsibleUserId], references: [id], onDelete: SetNull)
   status               ProjectStatus @default(PLANNED)
@@ -255,13 +269,16 @@ model Project {
   documents            ClientDocument[]
   installedItems       InstalledItem[]
 
+  @@index([customerId])
+  @@index([status])
+  @@index([responsibleUserId])
   @@map("projects")
 }
 
 model InstalledItem {
   id               String          @id @default(uuid()) @db.Uuid
   customerId       String          @map("customer_id") @db.Uuid
-  customer         Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer         Customer        @relation(fields: [customerId], references: [id], onDelete: Restrict)
   projectId        String?         @map("project_id") @db.Uuid
   project          Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
   productId        String?         @map("product_id") @db.Uuid
@@ -271,6 +288,9 @@ model InstalledItem {
   installationDate DateTime        @default(now()) @map("installation_date")
   serviceTickets   ServiceTicket[]
 
+  @@index([customerId])
+  @@index([projectId])
+  @@index([productId])
   @@map("installed_items")
 }
 
@@ -278,7 +298,7 @@ model ServiceTicket {
   id                   String          @id @default(uuid()) @db.Uuid
   ticketNumber         String          @unique @map("ticket_number")
   customerId           String          @map("customer_id") @db.Uuid
-  customer             Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer             Customer        @relation(fields: [customerId], references: [id], onDelete: Restrict)
   installedItemId      String?         @map("installed_item_id") @db.Uuid
   installedItem        InstalledItem?  @relation(fields: [installedItemId], references: [id], onDelete: SetNull)
   defectDescription    String          @map("defect_description")
@@ -294,13 +314,17 @@ model ServiceTicket {
   createdAt            DateTime        @default(now()) @map("created_at")
   documents            ClientDocument[]
 
+  @@index([customerId])
+  @@index([status])
+  @@index([priority])
+  @@index([assignedTechnicianId])
   @@map("service_tickets")
 }
 
 model ClientDocument {
   id          String         @id @default(uuid()) @db.Uuid
   customerId  String         @map("customer_id") @db.Uuid
-  customer    Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer    Customer       @relation(fields: [customerId], references: [id], onDelete: Restrict)
   offerId     String?        @map("offer_id") @db.Uuid
   offer       Offer?         @relation(fields: [offerId], references: [id], onDelete: SetNull)
   projectId   String?        @map("project_id") @db.Uuid
@@ -314,6 +338,10 @@ model ClientDocument {
   sizeBytes   Int?           @map("size_bytes")
   createdAt   DateTime       @default(now()) @map("created_at")
 
+  @@index([customerId])
+  @@index([projectId])
+  @@index([offerId])
+  @@index([serviceId])
   @@map("client_documents")
 }
 
@@ -326,12 +354,15 @@ model CalendarEvent {
   allDay      Boolean   @default(false) @map("all_day")
   eventType   String    @default("MEETING") @map("event_type")
   customerId  String?   @map("customer_id") @db.Uuid
-  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
   projectId   String?   @map("project_id")
   location    String?
   color       String?
   createdAt   DateTime  @default(now()) @map("created_at")
 
+  @@index([customerId])
+  @@index([projectId])
+  @@index([startDate])
   @@map("calendar_events")
 }
 
@@ -356,6 +387,8 @@ model PurchaseInvoice {
   items                 Json     @default("[]")
   createdAt             DateTime @default(now()) @map("created_at")
 
+  @@index([projectId])
+  @@index([status])
   @@map("purchase_invoices")
 }
 
@@ -385,6 +418,10 @@ model SalesInvoice {
   items                      Json     @default("[]")
   createdAt                  DateTime @default(now()) @map("created_at")
 
+  @@index([customerId])
+  @@index([projectId])
+  @@index([offerId])
+  @@index([status])
   @@map("sales_invoices")
 }
 
@@ -405,6 +442,8 @@ model DispatchNote {
   stockDeducted   Boolean  @default(false) @map("stock_deducted")
   createdAt       DateTime @default(now()) @map("created_at")
 
+  @@index([customerId])
+  @@index([projectId])
   @@map("dispatch_notes")
 }
 
@@ -426,6 +465,10 @@ model PaymentRecord {
   notes             String?
   createdAt         DateTime @default(now()) @map("created_at")
 
+  @@index([customerId])
+  @@index([projectId])
+  @@index([salesInvoiceId])
+  @@index([purchaseInvoiceId])
   @@map("payment_records")
 }
 
@@ -440,6 +483,9 @@ model InventoryMovement {
   at        String
   createdAt DateTime @default(now()) @map("created_at")
 
+  @@index([productId])
+  @@index([projectId])
+  @@index([createdAt])
   @@map("inventory_movements")
 }
 

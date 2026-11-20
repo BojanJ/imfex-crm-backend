@@ -10,7 +10,7 @@
     "db:migrate": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:seed": "npx tsx --env-file=.env prisma/seed.ts",
-    "db:generate": "prisma generate"
+    "db:generate": "prisma generate && tsc"
   },
   "prisma": {
     "seed": "npx tsx prisma/seed.ts"

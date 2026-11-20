@@ -20,6 +20,31 @@ import {
   buildCorsOptions,
   validateDocumentUpload,
 } from './security';
+import {
+  isUuid,
+  USER_ROLES,
+  SPEC_INPUT_TYPES,
+  CUSTOMER_TYPES,
+  OFFER_STATUSES,
+  PROJECT_STATUSES,
+  SERVICE_PRIORITIES,
+  SERVICE_STATUSES,
+  parseEnum,
+  parseOptionalDate,
+  parseIsoDateString,
+  parseFiniteNumber,
+  parsePagination,
+  buildPrismaPaginationArgs,
+  handleRouteError,
+} from './validation';
+import {
+  isObjectStorageConfigured,
+  persistDocumentPayload,
+  resolveDocumentBinary,
+  deleteStoredDocumentObject,
+  formatDocumentForList,
+  isStorageRef,
+} from './storage';
 
 const app = express();
 const prisma = new PrismaClient();
@@ -66,42 +91,13 @@ app.use((req, res, next) => {
 });
 app.use(express.urlencoded({ limit: '1mb', extended: true }));
 
-// Automatically ensure new columns exist in PostgreSQL on startup
-async function ensureSchemaColumns() {
-  try {
-    await prisma.$executeRawUnsafe(
-      `ALTER TABLE specification_keys ADD COLUMN IF NOT EXISTS default_value TEXT;`
-    );
-    await prisma.$executeRawUnsafe(
-      `ALTER TABLE specification_options ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE;`
-    );
-    await prisma.$executeRawUnsafe(
-      `ALTER TABLE offer_item_specifications ALTER COLUMN specification_key_id DROP NOT NULL;`
-    );
-    await prisma.$executeRawUnsafe(
-      `ALTER TABLE offer_item_specifications ADD COLUMN IF NOT EXISTS custom_key_name TEXT;`
-    );
-    await prisma.$executeRawUnsafe(
-      `ALTER TABLE offer_item_specifications ADD COLUMN IF NOT EXISTS custom_price_modifier DECIMAL(10, 2) DEFAULT 0.00;`
-    );
-    await prisma.$executeRawUnsafe(
-      `ALTER TABLE client_documents ADD COLUMN IF NOT EXISTS file_name TEXT;`
-    );
-    await prisma.$executeRawUnsafe(
-      `ALTER TABLE client_documents ADD COLUMN IF NOT EXISTS size_bytes INTEGER;`
-    );
-  } catch (err: any) {
-    console.warn('Auto schema evolution notice:', err?.message || err);
-  }
-}
-ensureSchemaColumns();
-
 // Health Check Endpoint for Render
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'IMFEX Enterprise CRM Backend',
     emailConfigured: Boolean(resendApiKey),
+    objectStorageConfigured: isObjectStorageConfigured(),
     timestamp: new Date().toISOString(),
   });
 });
@@ -245,8 +241,8 @@ app.post('/api/admin/clean-database', requireRole('SUPER_ADMIN'), async (req, re
       message: 'Database cleaned and verified with clean UTF-8 records.',
       purgedCorruptedCount: corruptedCust.length,
     });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/admin/clean-database');
   }
 });
 
@@ -304,8 +300,8 @@ app.post('/api/admin/reset-database', requireRole('SUPER_ADMIN'), async (req: Au
       success: true,
       message: `Database reset cleanly to fresh state. 0 records, 1 system user active (${currentAdmin.email}).`,
     });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/admin/reset-database');
   }
 });
 
@@ -410,12 +406,20 @@ app.post('/api/email/send-offer', emailLimiter, async (req, res) => {
 // Profiles / User Accounts API
 app.get('/api/profiles', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const profiles = await prisma.profile.findMany({
       select: SAFE_PROFILE_SELECT,
+      orderBy: { createdAt: 'asc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.profile.count()));
+    }
     res.json(profiles);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/profiles');
   }
 });
 
@@ -425,6 +429,9 @@ app.post('/api/profiles', requireRole('SUPER_ADMIN'), async (req, res) => {
     if (!isValidEmail(email)) {
       return res.status(400).json({ error: 'Valid email is required' });
     }
+    const roleCheck = parseEnum(role, USER_ROLES, 'role', 'USER');
+    if (!roleCheck.ok) return res.status(400).json({ error: roleCheck.error });
+
     const rawPassword =
       typeof password === 'string' && password.trim().length >= 8
         ? password.trim()
@@ -432,11 +439,11 @@ app.post('/api/profiles', requireRole('SUPER_ADMIN'), async (req, res) => {
     const passwordHash = await bcrypt.hash(rawPassword, 10);
     const profile = await prisma.profile.upsert({
       where: { email: email.trim().toLowerCase() },
-      update: { fullName, role, status: 'ACTIVE' },
+      update: { fullName, role: roleCheck.value, status: 'ACTIVE' },
       create: {
         email: email.trim().toLowerCase(),
         fullName,
-        role: role || 'USER',
+        role: roleCheck.value,
         passwordHash,
         mustChangePassword: true,
         status: 'ACTIVE',
@@ -444,14 +451,17 @@ app.post('/api/profiles', requireRole('SUPER_ADMIN'), async (req, res) => {
       select: SAFE_PROFILE_SELECT,
     });
     res.json(profile);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/profiles');
   }
 });
 
 app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
   try {
     const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid profile ID format.' });
+    }
     const isSuperAdmin = req.user?.role === 'SUPER_ADMIN';
     const isSelf = req.user?.id === id;
 
@@ -463,8 +473,17 @@ app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
     const updateData: any = {};
     if (fullName !== undefined) updateData.fullName = fullName;
     if (isSuperAdmin) {
-      if (role !== undefined) updateData.role = role;
-      if (status !== undefined) updateData.status = status;
+      if (role !== undefined) {
+        const roleCheck = parseEnum(role, USER_ROLES, 'role');
+        if (!roleCheck.ok) return res.status(400).json({ error: roleCheck.error });
+        updateData.role = roleCheck.value;
+      }
+      if (status !== undefined) {
+        if (status !== 'ACTIVE' && status !== 'DISABLED') {
+          return res.status(400).json({ error: 'Invalid status. Allowed values: ACTIVE, DISABLED.' });
+        }
+        updateData.status = status;
+      }
     } else if (role !== undefined || status !== undefined) {
       return res.status(403).json({ error: 'Only SUPER_ADMIN can modify role or status' });
     }
@@ -473,7 +492,6 @@ app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
         return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
       }
       updateData.passwordHash = await bcrypt.hash(password, 10);
-      // Admin resetting another user's password defaults to mustChangePassword = true
       if (isSuperAdmin && !isSelf) {
         updateData.mustChangePassword = mustChangePassword !== undefined ? Boolean(mustChangePassword) : true;
       } else {
@@ -489,68 +507,87 @@ app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
       select: SAFE_PROFILE_SELECT,
     });
     res.json(profile);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'PUT /api/profiles/:id');
   }
 });
 
 app.delete('/api/profiles/:id', requireRole('SUPER_ADMIN'), async (req: AuthenticatedRequest, res) => {
   try {
     const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid profile ID format.' });
+    }
     if (req.user?.id === id) {
       return res.status(400).json({ error: 'Cannot delete your own active account' });
     }
-    await prisma.profile.delete({ where: { id } }).catch(() => null);
+    await prisma.profile.delete({ where: { id } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/profiles/:id');
   }
 });
 
 // Categories API
 app.get('/api/categories', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const categories = await prisma.productCategory.findMany({
-      include: {
-        children: true,
-      },
+      include: { children: true },
+      orderBy: { createdAt: 'asc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.productCategory.count()));
+    }
     res.json(categories);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/categories');
   }
 });
 
 app.post('/api/categories', async (req, res) => {
   try {
-    const { id, name, parentId } = req.body;
-    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-    let category;
+    const { id, name, parentId } = req.body ?? {};
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    if (!cleanName) {
+      return res.status(400).json({ error: 'Category name is required.' });
+    }
+    if (parentId !== undefined && parentId !== null && parentId !== '' && !isUuid(parentId)) {
+      return res.status(400).json({ error: 'Invalid parentId UUID format.' });
+    }
+    const cleanParentId = isUuid(parentId) ? parentId : null;
 
-    if (isUuid) {
+    let category;
+    if (isUuid(id)) {
       category = await prisma.productCategory.upsert({
         where: { id },
-        update: { name, parentId: parentId || null },
-        create: { id, name, parentId: parentId || null },
+        update: { name: cleanName, parentId: cleanParentId },
+        create: { id, name: cleanName, parentId: cleanParentId },
       });
     } else {
       category = await prisma.productCategory.create({
-        data: { name, parentId: parentId || null },
+        data: { name: cleanName, parentId: cleanParentId },
       });
     }
     res.json(category);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/categories');
   }
 });
 
 app.delete('/api/categories/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.productCategory.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid category ID format.' });
+    }
+    await prisma.productCategory.delete({ where: { id } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/categories/:id');
   }
 });
 
@@ -579,6 +616,9 @@ const formatProductForResponse = (p: any) => {
 // Products API
 app.get('/api/products', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const products = await prisma.product.findMany({
       include: {
         category: true,
@@ -589,10 +629,15 @@ app.get('/api/products', async (req, res) => {
           },
         },
       },
+      orderBy: { createdAt: 'asc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.product.count()));
+    }
     res.json(products.map(formatProductForResponse));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/products');
   }
 });
 
@@ -611,230 +656,255 @@ app.post('/api/products', async (req, res) => {
       models,
       specificationKeys,
       categoryId,
-    } = req.body;
+    } = req.body ?? {};
 
-    if (!code) {
-      return res.status(400).json({ error: 'Product code is required' });
+    const cleanCode = typeof code === 'string' ? code.trim() : '';
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    if (!cleanCode) {
+      return res.status(400).json({ error: 'Product code is required.' });
+    }
+    if (!cleanName) {
+      return res.status(400).json({ error: 'Product name is required.' });
+    }
+    if (categoryId !== undefined && categoryId !== null && categoryId !== '' && !isUuid(categoryId)) {
+      return res.status(400).json({ error: 'Invalid categoryId UUID format.' });
+    }
+    const cleanCategoryId = isUuid(categoryId) ? categoryId : null;
+
+    const stockQtyCheck =
+      stockQuantity !== undefined
+        ? parseFiniteNumber(stockQuantity, 'stockQuantity', { min: 0, integer: true })
+        : null;
+    if (stockQtyCheck && !stockQtyCheck.ok) return res.status(400).json({ error: stockQtyCheck.error });
+
+    const reservedQtyCheck =
+      reservedQuantity !== undefined
+        ? parseFiniteNumber(reservedQuantity, 'reservedQuantity', { min: 0, integer: true })
+        : null;
+    if (reservedQtyCheck && !reservedQtyCheck.ok) return res.status(400).json({ error: reservedQtyCheck.error });
+
+    const purchasePriceCheck =
+      purchasePrice !== undefined
+        ? parseFiniteNumber(purchasePrice, 'purchasePrice', { min: 0 })
+        : null;
+    if (purchasePriceCheck && !purchasePriceCheck.ok) return res.status(400).json({ error: purchasePriceCheck.error });
+
+    if (Array.isArray(specificationKeys)) {
+      for (const sk of specificationKeys) {
+        if (sk?.inputType !== undefined) {
+          const check = parseEnum(sk.inputType, SPEC_INPUT_TYPES, 'specificationKey.inputType');
+          if (!check.ok) return res.status(400).json({ error: check.error });
+        }
+      }
     }
 
     const stockFields = {
-      ...(stockType !== undefined ? { stockType } : {}),
-      ...(stockQuantity !== undefined ? { stockQuantity: Math.max(0, Math.round(Number(stockQuantity) || 0)) } : {}),
-      ...(reservedQuantity !== undefined ? { reservedQuantity: Math.max(0, Math.round(Number(reservedQuantity) || 0)) } : {}),
-      ...(purchasePrice !== undefined ? { purchasePrice: Number(purchasePrice) || 0 } : {}),
+      ...(stockType !== undefined ? { stockType: String(stockType) } : {}),
+      ...(stockQtyCheck?.ok ? { stockQuantity: stockQtyCheck.value } : {}),
+      ...(reservedQtyCheck?.ok ? { reservedQuantity: reservedQtyCheck.value } : {}),
+      ...(purchasePriceCheck?.ok ? { purchasePrice: purchasePriceCheck.value } : {}),
     };
 
-    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-    let product;
-
-    if (isUuid) {
-      product = await prisma.product.upsert({
-        where: { id },
-        update: {
-          name,
-          code,
-          description,
-          isActive: isActive !== undefined ? isActive : true,
-          categoryId: categoryId || null,
-          ...stockFields,
-        },
-        create: {
-          id,
-          name,
-          code,
-          description,
-          isActive: isActive !== undefined ? isActive : true,
-          categoryId: categoryId || null,
-          ...stockFields,
-        },
-        include: {
-          category: true,
-          models: true,
-          specificationKeys: { include: { options: true } },
-        },
-      });
-    } else {
-      product = await prisma.product.upsert({
-        where: { code },
-        update: {
-          name,
-          description,
-          isActive: isActive !== undefined ? isActive : true,
-          categoryId: categoryId || null,
-          ...stockFields,
-        },
-        create: {
-          name,
-          code,
-          description,
-          isActive: isActive !== undefined ? isActive : true,
-          categoryId: categoryId || null,
-          ...stockFields,
-        },
-        include: {
-          category: true,
-          models: true,
-          specificationKeys: { include: { options: true } },
-        },
-      });
-    }
-
-    if (Array.isArray(models)) {
-      const keptModelIds: string[] = [];
-      for (const m of models) {
-        if (m.name) {
-          const isModelUuid = m.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(m.id);
-          let existingModel = isModelUuid
-            ? await prisma.productModel.findUnique({ where: { id: m.id } }).catch(() => null)
-            : null;
-          if (!existingModel) {
-            existingModel = await prisma.productModel.findFirst({
-              where: { productId: product.id, name: m.name },
-            });
-          }
-          if (existingModel) {
-            const updatedMod = await prisma.productModel.update({
-              where: { id: existingModel.id },
-              data: {
-                name: m.name,
-                basePrice: m.basePrice !== undefined ? Number(m.basePrice) : existingModel.basePrice,
+    const updatedProduct = await prisma.$transaction(
+      async (tx) => {
+        const product = isUuid(id)
+          ? await tx.product.upsert({
+              where: { id },
+              update: {
+                name: cleanName,
+                code: cleanCode,
+                description: description ?? null,
+                isActive: isActive !== undefined ? Boolean(isActive) : true,
+                categoryId: cleanCategoryId,
+                ...stockFields,
+              },
+              create: {
+                id,
+                name: cleanName,
+                code: cleanCode,
+                description: description ?? null,
+                isActive: isActive !== undefined ? Boolean(isActive) : true,
+                categoryId: cleanCategoryId,
+                ...stockFields,
+              },
+            })
+          : await tx.product.upsert({
+              where: { code: cleanCode },
+              update: {
+                name: cleanName,
+                description: description ?? null,
+                isActive: isActive !== undefined ? Boolean(isActive) : true,
+                categoryId: cleanCategoryId,
+                ...stockFields,
+              },
+              create: {
+                name: cleanName,
+                code: cleanCode,
+                description: description ?? null,
+                isActive: isActive !== undefined ? Boolean(isActive) : true,
+                categoryId: cleanCategoryId,
+                ...stockFields,
               },
             });
-            keptModelIds.push(updatedMod.id);
-          } else {
-            const createdMod = await prisma.productModel.create({
-              data: {
-                productId: product.id,
-                name: m.name,
-                basePrice: m.basePrice || 0,
-              },
-            });
-            keptModelIds.push(createdMod.id);
+
+        if (Array.isArray(models)) {
+          const existingModels = await tx.productModel.findMany({ where: { productId: product.id } });
+          const byId = new Map(existingModels.map((m) => [m.id, m]));
+          const byName = new Map(existingModels.map((m) => [m.name, m]));
+          const keptModelIds: string[] = [];
+
+          for (const m of models) {
+            if (!m?.name) continue;
+            const existingModel = (isUuid(m.id) ? byId.get(m.id) : undefined) || byName.get(m.name);
+            const price = m.basePrice !== undefined ? Number(m.basePrice) : undefined;
+            if (existingModel) {
+              const updatedMod = await tx.productModel.update({
+                where: { id: existingModel.id },
+                data: {
+                  name: m.name,
+                  basePrice: price !== undefined && Number.isFinite(price) ? price : existingModel.basePrice,
+                },
+              });
+              keptModelIds.push(updatedMod.id);
+            } else {
+              const createdMod = await tx.productModel.create({
+                data: {
+                  productId: product.id,
+                  name: m.name,
+                  basePrice: price !== undefined && Number.isFinite(price) ? price : 0,
+                },
+              });
+              keptModelIds.push(createdMod.id);
+            }
           }
+
+          await tx.productModel.deleteMany({
+            where: {
+              productId: product.id,
+              id: { notIn: keptModelIds },
+            },
+          });
         }
-      }
-      await prisma.productModel.deleteMany({
-        where: {
-          productId: product.id,
-          id: { notIn: keptModelIds },
-        },
-      });
-    }
 
-    if (Array.isArray(specificationKeys)) {
-      const keptKeyIds: string[] = [];
-      for (const sk of specificationKeys) {
-        if (sk.name) {
-          const isKeyUuid = sk.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sk.id);
-          let specKey = isKeyUuid
-            ? await prisma.specificationKey.findUnique({ where: { id: sk.id } }).catch(() => null)
-            : null;
-          if (!specKey) {
-            specKey = await prisma.specificationKey.findFirst({
-              where: { productId: product.id, name: sk.name },
-            });
-          }
-          if (!specKey) {
-            specKey = await prisma.specificationKey.create({
-              data: {
-                productId: product.id,
-                name: sk.name,
-                inputType: sk.inputType || 'SELECT',
-                defaultValue: sk.defaultValue || null,
-              },
-            });
-          } else {
-            specKey = await prisma.specificationKey.update({
-              where: { id: specKey.id },
-              data: {
-                name: sk.name,
-                inputType: sk.inputType || specKey.inputType,
-                defaultValue: sk.defaultValue !== undefined ? sk.defaultValue || null : specKey.defaultValue,
-              },
-            });
-          }
-          keptKeyIds.push(specKey.id);
+        if (Array.isArray(specificationKeys)) {
+          const existingKeys = await tx.specificationKey.findMany({
+            where: { productId: product.id },
+            include: { options: true },
+          });
+          const keyById = new Map(existingKeys.map((k) => [k.id, k]));
+          const keyByName = new Map(existingKeys.map((k) => [k.name, k]));
+          const keptKeyIds: string[] = [];
 
-          if (Array.isArray(sk.options)) {
-            const keptOptIds: string[] = [];
-            for (const opt of sk.options) {
-              if (opt.label) {
-                const isOptUuid = opt.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(opt.id);
-                let existingOpt = isOptUuid
-                  ? await prisma.specificationOption.findUnique({ where: { id: opt.id } }).catch(() => null)
-                  : null;
-                if (!existingOpt) {
-                  existingOpt = await prisma.specificationOption.findFirst({
-                    where: { specificationKeyId: specKey.id, label: opt.label },
-                  });
-                }
-                if (!existingOpt) {
-                  const createdOpt = await prisma.specificationOption.create({
-                    data: {
-                      specificationKeyId: specKey.id,
-                      label: opt.label,
-                      priceModifier: opt.priceModifier || 0,
-                      isDefault: Boolean(opt.isDefault),
-                    },
-                  });
-                  keptOptIds.push(createdOpt.id);
-                } else {
-                  const updatedOpt = await prisma.specificationOption.update({
+          for (const sk of specificationKeys) {
+            if (!sk?.name) continue;
+            const existingKey = (isUuid(sk.id) ? keyById.get(sk.id) : undefined) || keyByName.get(sk.name);
+
+            const specKey = existingKey
+              ? await tx.specificationKey.update({
+                  where: { id: existingKey.id },
+                  data: {
+                    name: sk.name,
+                    inputType: sk.inputType || existingKey.inputType,
+                    defaultValue: sk.defaultValue !== undefined ? sk.defaultValue || null : existingKey.defaultValue,
+                  },
+                })
+              : await tx.specificationKey.create({
+                  data: {
+                    productId: product.id,
+                    name: sk.name,
+                    inputType: sk.inputType || 'SELECT',
+                    defaultValue: sk.defaultValue || null,
+                  },
+                });
+            keptKeyIds.push(specKey.id);
+
+            if (Array.isArray(sk.options)) {
+              const existingOpts = existingKey?.options || [];
+              const optById = new Map(existingOpts.map((o) => [o.id, o]));
+              const optByLabel = new Map(existingOpts.map((o) => [o.label, o]));
+              const keptOptIds: string[] = [];
+
+              for (const opt of sk.options) {
+                if (!opt?.label) continue;
+                const existingOpt = (isUuid(opt.id) ? optById.get(opt.id) : undefined) || optByLabel.get(opt.label);
+                const modifier = opt.priceModifier !== undefined ? Number(opt.priceModifier) : undefined;
+
+                if (existingOpt) {
+                  const updatedOpt = await tx.specificationOption.update({
                     where: { id: existingOpt.id },
                     data: {
                       label: opt.label,
-                      priceModifier: opt.priceModifier !== undefined ? Number(opt.priceModifier) : existingOpt.priceModifier,
+                      priceModifier: modifier !== undefined && Number.isFinite(modifier) ? modifier : existingOpt.priceModifier,
                       isDefault: opt.isDefault !== undefined ? Boolean(opt.isDefault) : existingOpt.isDefault,
                     },
                   });
                   keptOptIds.push(updatedOpt.id);
+                } else {
+                  const createdOpt = await tx.specificationOption.create({
+                    data: {
+                      specificationKeyId: specKey.id,
+                      label: opt.label,
+                      priceModifier: modifier !== undefined && Number.isFinite(modifier) ? modifier : 0,
+                      isDefault: Boolean(opt.isDefault),
+                    },
+                  });
+                  keptOptIds.push(createdOpt.id);
                 }
               }
-            }
-            await prisma.specificationOption.deleteMany({
-              where: {
-                specificationKeyId: specKey.id,
-                id: { notIn: keptOptIds },
-              },
-            });
-          }
-        }
-      }
-      await prisma.specificationKey.deleteMany({
-        where: {
-          productId: product.id,
-          id: { notIn: keptKeyIds },
-        },
-      });
-    }
 
-    const updatedProduct = await prisma.product.findUnique({
-      where: { id: product.id },
-      include: { category: true, models: true, specificationKeys: { include: { options: true } } },
-    });
+              await tx.specificationOption.deleteMany({
+                where: {
+                  specificationKeyId: specKey.id,
+                  id: { notIn: keptOptIds },
+                },
+              });
+            }
+          }
+
+          await tx.specificationKey.deleteMany({
+            where: {
+              productId: product.id,
+              id: { notIn: keptKeyIds },
+            },
+          });
+        }
+
+        return tx.product.findUnique({
+          where: { id: product.id },
+          include: { category: true, models: true, specificationKeys: { include: { options: true } } },
+        });
+      },
+      { timeout: 20000 }
+    );
 
     res.json(formatProductForResponse(updatedProduct));
   } catch (error: any) {
-    if (error.code === 'P2002') {
-      return res.status(400).json({ error: 'Product with this code already exists.' });
+    if (error?.code === 'P2002') {
+      return res.status(409).json({ error: 'Product with this code already exists.' });
     }
-    res.status(500).json({ error: error.message });
+    return handleRouteError(res, error, 'POST /api/products');
   }
 });
 
 app.delete('/api/products/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.product.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid product ID format.' });
+    }
+    await prisma.product.delete({ where: { id } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/products/:id');
   }
 });
 
 // Customers API
 app.get('/api/customers', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const customers = await prisma.customer.findMany({
       include: {
         offers: true,
@@ -842,43 +912,79 @@ app.get('/api/customers', async (req, res) => {
         installedItems: true,
         serviceTickets: true,
       },
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
-    res.json(customers);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.customer.count()));
+    }
+    res.json(
+      customers.map((c) => ({
+        ...c,
+        offers: (c.offers || []).map(formatOfferForResponse),
+        serviceTickets: (c.serviceTickets || []).map(formatTicketForResponse),
+      }))
+    );
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/customers');
   }
 });
 
 app.post('/api/customers', async (req, res) => {
   try {
-    const { id, name, companyName, customerType, email, phone, address, city, notes } = req.body;
-    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-    let customer;
-    if (isUuid) {
-      customer = await prisma.customer.upsert({
-        where: { id },
-        update: { name: name || 'Клиент', companyName, customerType: customerType || 'COMPANY', email, phone, address, city, notes },
-        create: { id, name: name || 'Клиент', companyName, customerType: customerType || 'COMPANY', email, phone, address, city, notes },
-      });
-    } else {
-      customer = await prisma.customer.create({
-        data: { name: name || 'Клиент', companyName, customerType: customerType || 'COMPANY', email, phone, address, city, notes },
-      });
+    const { id, name, companyName, taxId, customerType, email, phone, address, city, notes } = req.body ?? {};
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    if (!cleanName) {
+      return res.status(400).json({ error: 'Customer name is required.' });
     }
+    const typeCheck = parseEnum(customerType, CUSTOMER_TYPES, 'customerType', 'COMPANY');
+    if (!typeCheck.ok) return res.status(400).json({ error: typeCheck.error });
+
+    if (email !== undefined && email !== null && String(email).trim() !== '' && !isValidEmail(email)) {
+      return res.status(400).json({ error: 'Invalid customer email address.' });
+    }
+
+    const data = {
+      name: cleanName,
+      companyName: companyName ?? null,
+      taxId: taxId !== undefined ? (taxId ? String(taxId).trim() : null) : null,
+      customerType: typeCheck.value,
+      email: email ? String(email).trim() : null,
+      phone: phone ?? null,
+      address: address ?? null,
+      city: city ?? null,
+      notes: notes ?? null,
+    };
+
+    const customer = isUuid(id)
+      ? await prisma.customer.upsert({
+          where: { id },
+          update: data,
+          create: { id, ...data },
+        })
+      : await prisma.customer.create({ data });
+
     res.json(customer);
-  } catch (error: any) {
-    console.error('POST /api/customers error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/customers');
   }
 });
 
 app.delete('/api/customers/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.customer.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid customer ID format.' });
+    }
+    await prisma.customer.delete({ where: { id } });
     res.json({ success: true, id });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'P2003') {
+      return res.status(409).json({
+        error: 'Cannot delete customer because linked offers, projects, service tickets, or documents exist.',
+      });
+    }
+    return handleRouteError(res, error, 'DELETE /api/customers/:id');
   }
 });
 
@@ -887,23 +993,26 @@ const formatOfferForResponse = (offer: any) => {
   if (!offer) return offer;
   return {
     ...offer,
-    taxRate: Number(offer.taxRate || 0),
-    discountRate: Number(offer.discountRate || 0),
-    discountAmount: Number(offer.discountAmount || 0),
-    subtotal: Number(offer.subtotal || 0),
-    taxAmount: Number(offer.taxAmount || 0),
-    totalAmount: Number(offer.totalAmount || 0),
+    taxRate: Number(offer.taxRate ?? 0),
+    discountRate: Number(offer.discountRate ?? 0),
+    discountAmount: Number(offer.discountAmount ?? 0),
+    subtotal: Number(offer.subtotal ?? 0),
+    taxAmount: Number(offer.taxAmount ?? 0),
+    totalAmount: Number(offer.totalAmount ?? 0),
     items: (offer.items || []).map((item: any) => ({
       ...item,
-      quantity: Number(item.quantity || 1),
-      unitPrice: Number(item.unitPrice || 0),
-      totalPrice: Number(item.totalPrice || 0),
+      quantity: Number(item.quantity ?? 1),
+      unitPrice: Number(item.unitPrice ?? 0),
+      totalPrice: Number(item.totalPrice ?? 0),
       specifications: (item.offerItemSpecifications || item.specifications || []).map((s: any) => ({
         specificationKeyId: s.specificationKeyId || `custom-${s.id}`,
         specificationOptionId: s.specificationOptionId || undefined,
         customValue: s.customValue || undefined,
         customKeyName: s.customKeyName || undefined,
-        customPriceModifier: s.customPriceModifier !== undefined && s.customPriceModifier !== null ? Number(s.customPriceModifier) : undefined,
+        customPriceModifier:
+          s.customPriceModifier !== undefined && s.customPriceModifier !== null
+            ? Number(s.customPriceModifier)
+            : undefined,
       })),
     })),
   };
@@ -912,6 +1021,9 @@ const formatOfferForResponse = (offer: any) => {
 // Offers API
 app.get('/api/offers', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const offers = await prisma.offer.findMany({
       include: {
         customer: true,
@@ -922,17 +1034,26 @@ app.get('/api/offers', async (req, res) => {
           },
         },
       },
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.offer.count()));
+    }
     res.json(offers.map(formatOfferForResponse));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/offers');
   }
 });
 
 app.get('/api/offers/:id', async (req, res) => {
   try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid offer ID format.' });
+    }
     const offer = await prisma.offer.findUnique({
-      where: { id: req.params.id },
+      where: { id },
       include: {
         customer: true,
         createdByUser: { select: SAFE_PROFILE_SELECT },
@@ -943,16 +1064,16 @@ app.get('/api/offers/:id', async (req, res) => {
         },
       },
     });
-    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    if (!offer) return res.status(404).json({ error: 'Offer not found.' });
     res.json(formatOfferForResponse(offer));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/offers/:id');
   }
 });
 
 app.post('/api/offers', async (req, res) => {
   try {
-    let {
+    const {
       id,
       offerNumber,
       customerId,
@@ -966,185 +1087,237 @@ app.post('/api/offers', async (req, res) => {
       totalAmount,
       validUntil,
       items,
-    } = req.body;
+    } = req.body ?? {};
 
-    const isUuid = (val?: string | null) =>
-      Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
+    // API-01: Strictly require a real, existing customerId — never silently fall back to first customer
+    if (!isUuid(customerId)) {
+      return res.status(400).json({ error: 'A valid customerId UUID is required.' });
+    }
+    const custExists = await prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+    if (!custExists) {
+      return res.status(404).json({ error: 'Referenced customer not found.' });
+    }
 
-    let validCustomerId = isUuid(customerId) ? customerId : null;
-    if (validCustomerId) {
-      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) validCustomerId = null;
-    }
-    if (!validCustomerId) {
-      const firstCust = await prisma.customer.findFirst();
-      if (firstCust) {
-        validCustomerId = firstCust.id;
-      } else {
-        const newCust = await prisma.customer.create({
-          data: { name: 'Главен Клиент', email: 'nabavki@logistika.mk' },
-        });
-        validCustomerId = newCust.id;
-      }
-    }
+    const statusCheck = parseEnum(status, OFFER_STATUSES, 'status', 'DRAFT');
+    if (!statusCheck.ok) return res.status(400).json({ error: statusCheck.error });
+
+    const validUntilCheck = parseOptionalDate(validUntil, 'validUntil');
+    if (!validUntilCheck.ok) return res.status(400).json({ error: validUntilCheck.error });
+
+    // API-03: Preserve 0% taxRate explicitly (only default to 18 when omitted/null/empty)
+    const taxRateCheck = parseFiniteNumber(taxRate, 'taxRate', { min: 0, max: 100, defaultVal: 18 });
+    if (!taxRateCheck.ok) return res.status(400).json({ error: taxRateCheck.error });
+
+    const discountRateCheck = parseFiniteNumber(discountRate, 'discountRate', { min: 0, max: 100, defaultVal: 0 });
+    if (!discountRateCheck.ok) return res.status(400).json({ error: discountRateCheck.error });
+
+    const discountAmountCheck = parseFiniteNumber(discountAmount, 'discountAmount', { min: 0, defaultVal: 0 });
+    if (!discountAmountCheck.ok) return res.status(400).json({ error: discountAmountCheck.error });
+
+    const subtotalCheck = parseFiniteNumber(subtotal, 'subtotal', { min: 0, defaultVal: 0 });
+    if (!subtotalCheck.ok) return res.status(400).json({ error: subtotalCheck.error });
+
+    const taxAmountCheck = parseFiniteNumber(taxAmount, 'taxAmount', { min: 0, defaultVal: 0 });
+    if (!taxAmountCheck.ok) return res.status(400).json({ error: taxAmountCheck.error });
+
+    const totalAmountCheck = parseFiniteNumber(totalAmount, 'totalAmount', { min: 0, defaultVal: 0 });
+    if (!totalAmountCheck.ok) return res.status(400).json({ error: totalAmountCheck.error });
 
     let validUserId: string | null = null;
     if (isUuid(createdByUserId)) {
-      const userExists = await prisma.profile.findUnique({ where: { id: createdByUserId } }).catch(() => null);
+      const userExists = await prisma.profile.findUnique({ where: { id: createdByUserId }, select: { id: true } });
       if (userExists) validUserId = userExists.id;
     }
 
-    // Check if offer exists by ID or offerNumber
-    let existingOffer = null;
-    if (isUuid(id)) {
-      existingOffer = await prisma.offer.findUnique({ where: { id } }).catch(() => null);
-    }
-    if (!existingOffer && offerNumber) {
-      existingOffer = await prisma.offer.findUnique({ where: { offerNumber } }).catch(() => null);
-    }
+    // API-02: Wrap offer upsert + item replacement + specification snapshots in a single transaction
+    const fullOffer = await prisma.$transaction(
+      async (tx) => {
+        let existingOffer = null;
+        if (isUuid(id)) {
+          existingOffer = await tx.offer.findUnique({ where: { id } });
+        }
+        if (!existingOffer && offerNumber) {
+          existingOffer = await tx.offer.findUnique({ where: { offerNumber: String(offerNumber) } });
+        }
 
-    let offer;
-    if (existingOffer) {
-      offer = await prisma.offer.update({
-        where: { id: existingOffer.id },
-        data: {
-          customerId: validCustomerId,
-          createdByUserId: validUserId,
-          status: status || existingOffer.status || 'DRAFT',
-          taxRate: taxRate !== undefined ? Number(taxRate) : existingOffer.taxRate,
-          discountRate: discountRate !== undefined ? Number(discountRate) : existingOffer.discountRate,
-          discountAmount: discountAmount !== undefined ? Number(discountAmount) : existingOffer.discountAmount,
-          subtotal: subtotal !== undefined ? Number(subtotal) : existingOffer.subtotal,
-          taxAmount: taxAmount !== undefined ? Number(taxAmount) : existingOffer.taxAmount,
-          totalAmount: totalAmount !== undefined ? Number(totalAmount) : existingOffer.totalAmount,
-          ...(validUntil !== undefined ? { validUntil: validUntil ? new Date(validUntil) : null } : {}),
-        },
-      });
-    } else {
-      let uniqueOfferNumber = offerNumber;
-      if (!uniqueOfferNumber) {
-        const count = await prisma.offer.count();
-        uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${String(count + 1).padStart(4, '0')}`;
-      }
+        let offer;
+        if (existingOffer) {
+          offer = await tx.offer.update({
+            where: { id: existingOffer.id },
+            data: {
+              customerId,
+              createdByUserId: validUserId ?? existingOffer.createdByUserId,
+              status: status !== undefined ? statusCheck.value : existingOffer.status,
+              taxRate: taxRate !== undefined && taxRate !== null && taxRate !== '' ? taxRateCheck.value : existingOffer.taxRate,
+              discountRate:
+                discountRate !== undefined && discountRate !== null && discountRate !== ''
+                  ? discountRateCheck.value
+                  : existingOffer.discountRate,
+              discountAmount:
+                discountAmount !== undefined && discountAmount !== null && discountAmount !== ''
+                  ? discountAmountCheck.value
+                  : existingOffer.discountAmount,
+              subtotal: subtotal !== undefined && subtotal !== null && subtotal !== '' ? subtotalCheck.value : existingOffer.subtotal,
+              taxAmount:
+                taxAmount !== undefined && taxAmount !== null && taxAmount !== '' ? taxAmountCheck.value : existingOffer.taxAmount,
+              totalAmount:
+                totalAmount !== undefined && totalAmount !== null && totalAmount !== ''
+                  ? totalAmountCheck.value
+                  : existingOffer.totalAmount,
+              ...(validUntil !== undefined ? { validUntil: validUntilCheck.value ?? null } : {}),
+            },
+          });
+        } else {
+          let uniqueOfferNumber = offerNumber ? String(offerNumber).trim() : '';
+          if (!uniqueOfferNumber) {
+            const count = await tx.offer.count();
+            uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${String(count + 1).padStart(4, '0')}`;
+          }
 
-      let conflict = await prisma.offer.findUnique({ where: { offerNumber: uniqueOfferNumber } }).catch(() => null);
-      let attempts = 0;
-      while (conflict && attempts < 10) {
-        attempts++;
-        const rand = Math.floor(1000 + Math.random() * 9000);
-        uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${rand}`;
-        conflict = await prisma.offer.findUnique({ where: { offerNumber: uniqueOfferNumber } }).catch(() => null);
-      }
+          let conflict = await tx.offer.findUnique({ where: { offerNumber: uniqueOfferNumber }, select: { id: true } });
+          let attempts = 0;
+          while (conflict && attempts < 10) {
+            attempts++;
+            const rand = Math.floor(1000 + Math.random() * 9000);
+            uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${rand}`;
+            conflict = await tx.offer.findUnique({ where: { offerNumber: uniqueOfferNumber }, select: { id: true } });
+          }
 
-      offer = await prisma.offer.create({
-        data: {
-          ...(isUuid(id) ? { id } : {}),
-          offerNumber: uniqueOfferNumber,
-          customerId: validCustomerId,
-          createdByUserId: validUserId,
-          status: status || 'DRAFT',
-          taxRate: taxRate !== undefined && taxRate !== null ? Number(taxRate) : 18.0,
-          discountRate: discountRate !== undefined && discountRate !== null ? Number(discountRate) : 0.0,
-          discountAmount: discountAmount !== undefined && discountAmount !== null ? Number(discountAmount) : 0.0,
-          subtotal: subtotal !== undefined && subtotal !== null ? Number(subtotal) : 0.0,
-          taxAmount: taxAmount !== undefined && taxAmount !== null ? Number(taxAmount) : 0.0,
-          totalAmount: totalAmount !== undefined && totalAmount !== null ? Number(totalAmount) : 0.0,
-          validUntil: validUntil ? new Date(validUntil) : null,
-        },
-      });
-    }
+          offer = await tx.offer.create({
+            data: {
+              ...(isUuid(id) ? { id } : {}),
+              offerNumber: uniqueOfferNumber,
+              customerId,
+              createdByUserId: validUserId,
+              status: statusCheck.value,
+              taxRate: taxRateCheck.value,
+              discountRate: discountRateCheck.value,
+              discountAmount: discountAmountCheck.value,
+              subtotal: subtotalCheck.value,
+              taxAmount: taxAmountCheck.value,
+              totalAmount: totalAmountCheck.value,
+              validUntil: validUntilCheck.value ?? null,
+            },
+          });
+        }
 
-    if (Array.isArray(items)) {
-      await prisma.offerItem.deleteMany({ where: { offerId: offer.id } });
-      for (const item of items) {
-        const isProdUuid = item.productId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.productId);
-        const isModelUuid = item.productModelId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.productModelId);
-        const createdItem = await prisma.offerItem.create({
-          data: {
-            offerId: offer.id,
-            productId: isProdUuid ? item.productId : null,
-            productModelId: isModelUuid ? item.productModelId : null,
-            customTitle: item.customTitle || '',
-            serviceTypes: Array.isArray(item.serviceTypes) ? item.serviceTypes : [],
-            widthMm: item.widthMm ? Number(item.widthMm) : null,
-            heightMm: item.heightMm ? Number(item.heightMm) : null,
-            quantity: item.quantity ? Number(item.quantity) : 1,
-            unitPrice: item.unitPrice ? Number(item.unitPrice) : 0,
-            totalPrice: item.totalPrice ? Number(item.totalPrice) : 0,
-          },
-        });
-
-        const rawSpecs = Array.isArray(item.specifications)
-          ? item.specifications
-          : Array.isArray(item.offerItemSpecifications)
-          ? item.offerItemSpecifications
-          : [];
-
-        for (const spec of rawSpecs) {
-          const isSpecKeyUuid = spec.specificationKeyId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec.specificationKeyId);
-          const isSpecOptUuid = spec.specificationOptionId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec.specificationOptionId);
-          if (isSpecKeyUuid) {
-            const specKeyExists = await prisma.specificationKey.findUnique({ where: { id: spec.specificationKeyId } }).catch(() => null);
-            if (specKeyExists) {
-              let validOptId: string | null = null;
-              if (isSpecOptUuid) {
-                const optExists = await prisma.specificationOption.findUnique({ where: { id: spec.specificationOptionId } }).catch(() => null);
-                if (optExists) validOptId = spec.specificationOptionId;
-              }
-              await prisma.offerItemSpecification.create({
-                data: {
-                  offerItemId: createdItem.id,
-                  specificationKeyId: spec.specificationKeyId,
-                  specificationOptionId: validOptId,
-                  customValue: spec.customValue || null,
-                  customKeyName: spec.customKeyName || null,
-                  customPriceModifier: spec.customPriceModifier ? Number(spec.customPriceModifier) : 0,
-                },
-              }).catch((e) => console.warn('Skipping offerItemSpecification insert warning:', e?.message || e));
+        if (Array.isArray(items)) {
+          // Pre-fetch referenced spec keys & options once for fast lookup and API-05 snapshots
+          const keyIds = new Set<string>();
+          const optIds = new Set<string>();
+          for (const item of items) {
+            const rawSpecs = Array.isArray(item?.specifications)
+              ? item.specifications
+              : Array.isArray(item?.offerItemSpecifications)
+              ? item.offerItemSpecifications
+              : [];
+            for (const spec of rawSpecs) {
+              if (isUuid(spec?.specificationKeyId)) keyIds.add(spec.specificationKeyId);
+              if (isUuid(spec?.specificationOptionId)) optIds.add(spec.specificationOptionId);
             }
-          } else if (spec.customKeyName || spec.customValue) {
-            await prisma.offerItemSpecification.create({
+          }
+
+          const [specKeys, specOpts] = await Promise.all([
+            keyIds.size > 0
+              ? tx.specificationKey.findMany({ where: { id: { in: Array.from(keyIds) } }, select: { id: true, name: true } })
+              : Promise.resolve([]),
+            optIds.size > 0
+              ? tx.specificationOption.findMany({ where: { id: { in: Array.from(optIds) } }, select: { id: true, label: true } })
+              : Promise.resolve([]),
+          ]);
+          const specKeyMap = new Map(specKeys.map((k) => [k.id, k]));
+          const specOptMap = new Map(specOpts.map((o) => [o.id, o]));
+
+          await tx.offerItem.deleteMany({ where: { offerId: offer.id } });
+
+          for (const item of items) {
+            const createdItem = await tx.offerItem.create({
               data: {
-                offerItemId: createdItem.id,
-                specificationKeyId: null,
-                specificationOptionId: null,
-                customValue: spec.customValue || null,
-                customKeyName: spec.customKeyName || 'Прилагодена спецификација',
-                customPriceModifier: spec.customPriceModifier ? Number(spec.customPriceModifier) : 0,
+                offerId: offer.id,
+                productId: isUuid(item?.productId) ? item.productId : null,
+                productModelId: isUuid(item?.productModelId) ? item.productModelId : null,
+                customTitle: item?.customTitle || '',
+                serviceTypes: Array.isArray(item?.serviceTypes) ? item.serviceTypes : [],
+                widthMm: item?.widthMm !== undefined && item?.widthMm !== null && item?.widthMm !== '' ? Math.round(Number(item.widthMm)) : null,
+                heightMm: item?.heightMm !== undefined && item?.heightMm !== null && item?.heightMm !== '' ? Math.round(Number(item.heightMm)) : null,
+                quantity: Math.max(1, Math.round(Number(item?.quantity ?? 1) || 1)),
+                unitPrice: Number.isFinite(Number(item?.unitPrice)) ? Number(item.unitPrice) : 0,
+                totalPrice: Number.isFinite(Number(item?.totalPrice)) ? Number(item.totalPrice) : 0,
               },
-            }).catch((e) => console.warn('Skipping custom offerItemSpecification insert warning:', e?.message || e));
+            });
+
+            const rawSpecs = Array.isArray(item?.specifications)
+              ? item.specifications
+              : Array.isArray(item?.offerItemSpecifications)
+              ? item.offerItemSpecifications
+              : [];
+
+            const specRows: any[] = [];
+            for (const spec of rawSpecs) {
+              if (isUuid(spec?.specificationKeyId) && specKeyMap.has(spec.specificationKeyId)) {
+                const keyInfo = specKeyMap.get(spec.specificationKeyId)!;
+                const optInfo = isUuid(spec?.specificationOptionId) ? specOptMap.get(spec.specificationOptionId) : undefined;
+                specRows.push({
+                  offerItemId: createdItem.id,
+                  specificationKeyId: keyInfo.id,
+                  specificationOptionId: optInfo ? optInfo.id : null,
+                  // Snapshot readable key & option text so API-05 SetNull preserves historical quotes
+                  customValue: spec.customValue || optInfo?.label || null,
+                  customKeyName: spec.customKeyName || keyInfo.name,
+                  customPriceModifier: Number.isFinite(Number(spec.customPriceModifier)) ? Number(spec.customPriceModifier) : 0,
+                });
+              } else if (spec?.customKeyName || spec?.customValue) {
+                specRows.push({
+                  offerItemId: createdItem.id,
+                  specificationKeyId: null,
+                  specificationOptionId: null,
+                  customValue: spec.customValue || null,
+                  customKeyName: spec.customKeyName || 'Прилагодена спецификација',
+                  customPriceModifier: Number.isFinite(Number(spec.customPriceModifier)) ? Number(spec.customPriceModifier) : 0,
+                });
+              }
+            }
+            if (specRows.length > 0) {
+              await tx.offerItemSpecification.createMany({ data: specRows });
+            }
           }
         }
-      }
-    }
 
-    const fullOffer = await prisma.offer.findUnique({
-      where: { id: offer.id },
-      include: {
-        customer: true,
-        createdByUser: { select: SAFE_PROFILE_SELECT },
-        items: {
+        return tx.offer.findUnique({
+          where: { id: offer.id },
           include: {
-            offerItemSpecifications: true,
+            customer: true,
+            createdByUser: { select: SAFE_PROFILE_SELECT },
+            items: {
+              include: {
+                offerItemSpecifications: true,
+              },
+            },
           },
-        },
+        });
       },
-    });
+      { timeout: 20000 }
+    );
 
     res.json(formatOfferForResponse(fullOffer));
-  } catch (error: any) {
-    console.error('POST /api/offers error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/offers');
   }
 });
 
 app.delete('/api/offers/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.offer.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid offer ID format.' });
+    }
+    await prisma.offer.delete({ where: { id } });
     res.json({ success: true, id });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (error?.code === 'P2003') {
+      return res.status(409).json({ error: 'Cannot delete offer because a linked project exists.' });
+    }
+    return handleRouteError(res, error, 'DELETE /api/offers/:id');
   }
 });
 
@@ -1176,29 +1349,26 @@ const extractWorkflowData = (body: any) => {
   return hasAny ? wf : undefined;
 };
 
-const formatProjectForResponse = (project: any) => {
+const formatProjectForResponse = (project: any, includeDocumentData = false) => {
   if (!project) return project;
   const wf = project.workflowData && typeof project.workflowData === 'object' ? project.workflowData : {};
   return {
     ...wf,
     ...project,
-    offer: project.offer
-      ? {
-          ...project.offer,
-          taxRate: Number(project.offer.taxRate || 0),
-          discountRate: Number(project.offer.discountRate || 0),
-          discountAmount: Number(project.offer.discountAmount || 0),
-          subtotal: Number(project.offer.subtotal || 0),
-          taxAmount: Number(project.offer.taxAmount || 0),
-          totalAmount: Number(project.offer.totalAmount || 0),
-        }
-      : project.offer,
+    offer: project.offer ? formatOfferForResponse(project.offer) : project.offer,
+    documents: Array.isArray(project.documents)
+      ? project.documents.map((d: any) => formatDocumentForList(d, includeDocumentData))
+      : project.documents,
   };
 };
 
 // Projects API
 app.get('/api/projects', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+    const includeData = req.query.includeData === 'true';
+
     const projects = await prisma.project.findMany({
       include: {
         customer: true,
@@ -1207,17 +1377,27 @@ app.get('/api/projects', async (req, res) => {
         installedItems: true,
         documents: true,
       },
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
-    res.json(projects.map(formatProjectForResponse));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.project.count()));
+    }
+    res.json(projects.map((p) => formatProjectForResponse(p, includeData)));
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/projects');
   }
 });
 
 app.get('/api/projects/:id', async (req, res) => {
   try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid project ID format.' });
+    }
+    const includeData = req.query.includeData === 'true';
     const project = await prisma.project.findUnique({
-      where: { id: req.params.id },
+      where: { id },
       include: {
         customer: true,
         offer: true,
@@ -1226,10 +1406,10 @@ app.get('/api/projects/:id', async (req, res) => {
         documents: true,
       },
     });
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-    res.json(formatProjectForResponse(project));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (!project) return res.status(404).json({ error: 'Project not found.' });
+    res.json(formatProjectForResponse(project, includeData));
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/projects/:id');
   }
 });
 
@@ -1252,51 +1432,83 @@ app.post('/api/projects', async (req, res) => {
       installationContact,
       installationMinutes,
       signatureUrl,
-    } = req.body;
+    } = req.body ?? {};
 
-    let validOfferId = offerId;
-    if (validOfferId) {
-      const offerExists = await prisma.offer.findUnique({ where: { id: validOfferId } }).catch(() => null);
-      if (!offerExists) validOfferId = null;
+    const cleanProjectNumber = typeof projectNumber === 'string' ? projectNumber.trim() : '';
+    if (!cleanProjectNumber) {
+      return res.status(400).json({ error: 'projectNumber is required.' });
     }
 
-    let validCustomerId = customerId;
-    if (validCustomerId) {
-      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) {
-        const firstCust = await prisma.customer.findFirst();
-        if (firstCust) validCustomerId = firstCust.id;
-      }
-    }
+    const statusCheck = parseEnum(status, PROJECT_STATUSES, 'status', 'PLANNED');
+    if (!statusCheck.ok) return res.status(400).json({ error: statusCheck.error });
 
-    if (!validCustomerId || !validOfferId) {
-      if (!validCustomerId) {
-        const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
-        validCustomerId = newCust.id;
-      }
-      if (!validOfferId) {
-        const newOffer = await prisma.offer.create({
-          data: {
-            offerNumber: `OFF-TMP-${Date.now()}`,
-            customerId: validCustomerId,
-            status: 'ACCEPTED',
-          },
-        });
-        validOfferId = newOffer.id;
-      }
-    }
-
-    let validRespUser = responsibleUserId;
-    if (validRespUser) {
-      const userExists = await prisma.profile.findUnique({ where: { id: validRespUser } }).catch(() => null);
-      if (!userExists) validRespUser = null;
-    }
+    const startDateCheck = parseOptionalDate(startDate, 'startDate');
+    if (!startDateCheck.ok) return res.status(400).json({ error: startDateCheck.error });
+    const targetDeliveryCheck = parseOptionalDate(targetDeliveryDate, 'targetDeliveryDate');
+    if (!targetDeliveryCheck.ok) return res.status(400).json({ error: targetDeliveryCheck.error });
+    const actualDeliveryCheck = parseOptionalDate(actualDeliveryDate, 'actualDeliveryDate');
+    if (!actualDeliveryCheck.ok) return res.status(400).json({ error: actualDeliveryCheck.error });
+    const installDateCheck = parseOptionalDate(installationDate, 'installationDate');
+    if (!installDateCheck.ok) return res.status(400).json({ error: installDateCheck.error });
 
     const existingProj = await prisma.project.findUnique({
-      where: { projectNumber },
-      select: { workflowData: true },
-    }).catch(() => null);
-    const incomingWorkflow = extractWorkflowData(req.body);
+      where: { projectNumber: cleanProjectNumber },
+      select: { id: true, offerId: true, customerId: true, workflowData: true },
+    });
+
+    // API-01: Strictly require valid existing offerId & customerId — never fabricate fake customers or OFF-TMP offers
+    let validOfferId: string | null = null;
+    let resolvedOfferCustomerId: string | null = null;
+    if (offerId !== undefined && offerId !== null && offerId !== '') {
+      if (!isUuid(offerId)) {
+        return res.status(400).json({ error: 'Invalid offerId UUID format.' });
+      }
+      const offerExists = await prisma.offer.findUnique({
+        where: { id: offerId },
+        select: { id: true, customerId: true },
+      });
+      if (!offerExists) {
+        return res.status(404).json({ error: 'Referenced offer not found.' });
+      }
+      validOfferId = offerExists.id;
+      resolvedOfferCustomerId = offerExists.customerId;
+    } else if (existingProj) {
+      validOfferId = existingProj.offerId;
+    } else {
+      return res.status(400).json({ error: 'A valid offerId UUID is required to create a project.' });
+    }
+
+    let validCustomerId: string | null = null;
+    if (customerId !== undefined && customerId !== null && customerId !== '') {
+      if (!isUuid(customerId)) {
+        return res.status(400).json({ error: 'Invalid customerId UUID format.' });
+      }
+      const custExists = await prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+      if (!custExists) {
+        return res.status(404).json({ error: 'Referenced customer not found.' });
+      }
+      validCustomerId = custExists.id;
+    } else if (existingProj) {
+      validCustomerId = existingProj.customerId;
+    } else if (resolvedOfferCustomerId) {
+      validCustomerId = resolvedOfferCustomerId;
+    } else {
+      return res.status(400).json({ error: 'A valid customerId UUID is required.' });
+    }
+
+    let validRespUser: string | null = null;
+    if (responsibleUserId !== undefined && responsibleUserId !== null && responsibleUserId !== '') {
+      if (!isUuid(responsibleUserId)) {
+        return res.status(400).json({ error: 'Invalid responsibleUserId UUID format.' });
+      }
+      const userExists = await prisma.profile.findUnique({ where: { id: responsibleUserId }, select: { id: true } });
+      if (!userExists) {
+        return res.status(404).json({ error: 'Referenced responsible user not found.' });
+      }
+      validRespUser = userExists.id;
+    }
+
+    const incomingWorkflow = extractWorkflowData(req.body ?? {});
     const mergedWorkflowData = incomingWorkflow
       ? {
           ...(existingProj?.workflowData && typeof existingProj.workflowData === 'object'
@@ -1307,17 +1519,17 @@ app.post('/api/projects', async (req, res) => {
       : undefined;
 
     const project = await prisma.project.upsert({
-      where: { projectNumber },
+      where: { projectNumber: cleanProjectNumber },
       update: {
-        status: status || 'PLANNED',
+        status: statusCheck.value,
         procurementStatus,
         procurementNotes,
-        responsibleUserId: validRespUser,
-        startDate: startDate ? new Date(startDate) : undefined,
-        targetDeliveryDate: targetDeliveryDate ? new Date(targetDeliveryDate) : undefined,
-        actualDeliveryDate: actualDeliveryDate ? new Date(actualDeliveryDate) : undefined,
+        responsibleUserId: responsibleUserId !== undefined ? validRespUser : undefined,
+        startDate: startDateCheck.value,
+        targetDeliveryDate: targetDeliveryCheck.value,
+        actualDeliveryDate: actualDeliveryCheck.value,
         installationTeam,
-        installationDate: installationDate ? new Date(installationDate) : undefined,
+        installationDate: installDateCheck.value,
         installationAddress,
         installationContact,
         installationMinutes,
@@ -1325,18 +1537,18 @@ app.post('/api/projects', async (req, res) => {
         ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
       },
       create: {
-        projectNumber,
+        projectNumber: cleanProjectNumber,
         offerId: validOfferId,
         customerId: validCustomerId,
-        status: status || 'PLANNED',
+        status: statusCheck.value,
         procurementStatus,
         procurementNotes,
         responsibleUserId: validRespUser,
-        startDate: startDate ? new Date(startDate) : undefined,
-        targetDeliveryDate: targetDeliveryDate ? new Date(targetDeliveryDate) : undefined,
-        actualDeliveryDate: actualDeliveryDate ? new Date(actualDeliveryDate) : undefined,
+        startDate: startDateCheck.value ?? undefined,
+        targetDeliveryDate: targetDeliveryCheck.value ?? undefined,
+        actualDeliveryDate: actualDeliveryCheck.value ?? undefined,
         installationTeam,
-        installationDate: installationDate ? new Date(installationDate) : undefined,
+        installationDate: installDateCheck.value ?? undefined,
         installationAddress,
         installationContact,
         installationMinutes,
@@ -1346,19 +1558,21 @@ app.post('/api/projects', async (req, res) => {
       include: { customer: true, offer: true, responsibleUser: { select: SAFE_PROFILE_SELECT } },
     });
     res.json(formatProjectForResponse(project));
-  } catch (error: any) {
-    console.error('POST /api/projects error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/projects');
   }
 });
 
 app.delete('/api/projects/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.project.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid project ID format.' });
+    }
+    await prisma.project.delete({ where: { id } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/projects/:id');
   }
 });
 
@@ -1367,40 +1581,52 @@ const formatTicketForResponse = (ticket: any) => {
   if (!ticket) return ticket;
   return {
     ...ticket,
-    laborHours: Number(ticket.laborHours || 0),
+    laborHours: Number(ticket.laborHours ?? 0),
   };
 };
 
 // Service Tickets API
 app.get('/api/service-tickets', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const tickets = await prisma.serviceTicket.findMany({
       include: {
         customer: true,
         installedItem: true,
         assignedTechnician: { select: SAFE_PROFILE_SELECT },
       },
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.serviceTicket.count()));
+    }
     res.json(tickets.map(formatTicketForResponse));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/service-tickets');
   }
 });
 
 app.get('/api/service-tickets/:id', async (req, res) => {
   try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid service ticket ID format.' });
+    }
     const ticket = await prisma.serviceTicket.findUnique({
-      where: { id: req.params.id },
+      where: { id },
       include: {
         customer: true,
         installedItem: true,
         assignedTechnician: { select: SAFE_PROFILE_SELECT },
       },
     });
-    if (!ticket) return res.status(404).json({ error: 'Service ticket not found' });
+    if (!ticket) return res.status(404).json({ error: 'Service ticket not found.' });
     res.json(formatTicketForResponse(ticket));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/service-tickets/:id');
   }
 });
 
@@ -1419,274 +1645,398 @@ app.post('/api/service-tickets', async (req, res) => {
       scheduledDate,
       partsConsumed,
       closedAt,
-    } = req.body;
+    } = req.body ?? {};
 
-    let validCustomerId = customerId;
-    if (validCustomerId) {
-      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) {
-        const firstCust = await prisma.customer.findFirst();
-        if (firstCust) validCustomerId = firstCust.id;
+    const cleanTicketNumber = typeof ticketNumber === 'string' ? ticketNumber.trim() : '';
+    if (!cleanTicketNumber) {
+      return res.status(400).json({ error: 'ticketNumber is required.' });
+    }
+
+    // API-01: Strictly validate customerId
+    if (!isUuid(customerId)) {
+      return res.status(400).json({ error: 'A valid customerId UUID is required.' });
+    }
+    const custExists = await prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+    if (!custExists) {
+      return res.status(404).json({ error: 'Referenced customer not found.' });
+    }
+
+    const priorityCheck = parseEnum(priority, SERVICE_PRIORITIES, 'priority', 'MEDIUM');
+    if (!priorityCheck.ok) return res.status(400).json({ error: priorityCheck.error });
+
+    const statusCheck = parseEnum(status, SERVICE_STATUSES, 'status', 'OPEN');
+    if (!statusCheck.ok) return res.status(400).json({ error: statusCheck.error });
+
+    const laborCheck = parseFiniteNumber(laborHours, 'laborHours', { min: 0, defaultVal: 0 });
+    if (!laborCheck.ok) return res.status(400).json({ error: laborCheck.error });
+
+    const scheduledCheck = parseOptionalDate(scheduledDate, 'scheduledDate');
+    if (!scheduledCheck.ok) return res.status(400).json({ error: scheduledCheck.error });
+
+    const closedAtCheck = parseOptionalDate(closedAt, 'closedAt');
+    if (!closedAtCheck.ok) return res.status(400).json({ error: closedAtCheck.error });
+
+    let validItem: string | null = null;
+    if (installedItemId !== undefined && installedItemId !== null && installedItemId !== '') {
+      if (!isUuid(installedItemId)) {
+        return res.status(400).json({ error: 'Invalid installedItemId UUID format.' });
       }
-    }
-    if (!validCustomerId) {
-      const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
-      validCustomerId = newCust.id;
-    }
-
-    let validItem = installedItemId;
-    if (validItem) {
-      const itemExists = await prisma.installedItem.findUnique({ where: { id: validItem } }).catch(() => null);
-      if (!itemExists) validItem = null;
+      const itemExists = await prisma.installedItem.findUnique({ where: { id: installedItemId }, select: { id: true } });
+      if (!itemExists) return res.status(404).json({ error: 'Referenced installed item not found.' });
+      validItem = itemExists.id;
     }
 
-    let validTech = assignedTechnicianId;
-    if (validTech) {
-      const techExists = await prisma.profile.findUnique({ where: { id: validTech } }).catch(() => null);
-      if (!techExists) validTech = null;
+    let validTech: string | null = null;
+    if (assignedTechnicianId !== undefined && assignedTechnicianId !== null && assignedTechnicianId !== '') {
+      if (!isUuid(assignedTechnicianId)) {
+        return res.status(400).json({ error: 'Invalid assignedTechnicianId UUID format.' });
+      }
+      const techExists = await prisma.profile.findUnique({ where: { id: assignedTechnicianId }, select: { id: true } });
+      if (!techExists) return res.status(404).json({ error: 'Referenced technician not found.' });
+      validTech = techExists.id;
     }
 
     const ticket = await prisma.serviceTicket.upsert({
-      where: { ticketNumber },
+      where: { ticketNumber: cleanTicketNumber },
       update: {
-        priority: priority || 'MEDIUM',
-        status: status || 'OPEN',
+        priority: priorityCheck.value,
+        status: statusCheck.value,
         defectDescription: defectDescription || 'Пријавен дефект',
-        laborHours: laborHours ? Number(laborHours) : 0,
+        laborHours: laborCheck.value,
         solution,
-        assignedTechnicianId: validTech,
-        scheduledDate: scheduledDate ? new Date(scheduledDate) : undefined,
+        assignedTechnicianId: assignedTechnicianId !== undefined ? validTech : undefined,
+        scheduledDate: scheduledCheck.value,
         partsConsumed,
-        closedAt: closedAt ? new Date(closedAt) : undefined,
+        closedAt: closedAtCheck.value,
       },
       create: {
-        ticketNumber,
-        customerId: validCustomerId,
+        ticketNumber: cleanTicketNumber,
+        customerId,
         installedItemId: validItem,
         defectDescription: defectDescription || 'Пријавен дефект',
-        priority: priority || 'MEDIUM',
-        status: status || 'OPEN',
-        laborHours: laborHours ? Number(laborHours) : 0,
+        priority: priorityCheck.value,
+        status: statusCheck.value,
+        laborHours: laborCheck.value,
         solution,
         assignedTechnicianId: validTech,
-        scheduledDate: scheduledDate ? new Date(scheduledDate) : undefined,
+        scheduledDate: scheduledCheck.value ?? undefined,
         partsConsumed,
-        closedAt: closedAt ? new Date(closedAt) : undefined,
+        closedAt: closedAtCheck.value ?? undefined,
       },
       include: { customer: true, installedItem: true, assignedTechnician: { select: SAFE_PROFILE_SELECT } },
     });
-    res.json(ticket);
-  } catch (error: any) {
-    console.error('POST /api/service-tickets error:', error);
-    res.status(500).json({ error: error.message });
+    res.json(formatTicketForResponse(ticket));
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/service-tickets');
   }
 });
 
 app.delete('/api/service-tickets/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.serviceTicket.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid service ticket ID format.' });
+    }
+    await prisma.serviceTicket.delete({ where: { id } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/service-tickets/:id');
   }
 });
 
 // Installed Items API
 app.get('/api/installed-items', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const items = await prisma.installedItem.findMany({
       include: { customer: true, project: true, product: true },
+      orderBy: { installationDate: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
-    res.json(items);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.installedItem.count()));
+    }
+    res.json(
+      items.map((it) => ({
+        ...it,
+        product: it.product ? formatProductForResponse(it.product) : it.product,
+      }))
+    );
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/installed-items');
   }
 });
 
 app.post('/api/installed-items', async (req, res) => {
   try {
-    const { id, customerId, projectId, productId, title, serialNumber, installationDate } = req.body;
-    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-    let validCustomerId = customerId;
-    if (validCustomerId) {
-      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) {
-        const firstCust = await prisma.customer.findFirst();
-        if (firstCust) validCustomerId = firstCust.id;
-      }
-    }
-    if (!validCustomerId) {
-      const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
-      validCustomerId = newCust.id;
+    const { id, customerId, projectId, productId, title, serialNumber, installationDate } = req.body ?? {};
+    const cleanTitle = typeof title === 'string' ? title.trim() : '';
+    if (!cleanTitle) {
+      return res.status(400).json({ error: 'title is required.' });
     }
 
-    let item;
-    if (isUuid) {
-      item = await prisma.installedItem.upsert({
-        where: { id },
-        update: { title, serialNumber, installationDate: installationDate ? new Date(installationDate) : undefined },
-        create: { id, customerId: validCustomerId, projectId, productId, title, serialNumber, installationDate: installationDate ? new Date(installationDate) : undefined },
-      });
-    } else {
-      item = await prisma.installedItem.create({
-        data: { customerId: validCustomerId, projectId, productId, title, serialNumber, installationDate: installationDate ? new Date(installationDate) : undefined },
-      });
+    // API-01: Strictly validate customerId
+    if (!isUuid(customerId)) {
+      return res.status(400).json({ error: 'A valid customerId UUID is required.' });
     }
+    const custExists = await prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+    if (!custExists) {
+      return res.status(404).json({ error: 'Referenced customer not found.' });
+    }
+
+    // API-07: Validate optional projectId, productId UUIDs & installationDate
+    let validProjectId: string | null = null;
+    if (projectId !== undefined && projectId !== null && projectId !== '') {
+      if (!isUuid(projectId)) return res.status(400).json({ error: 'Invalid projectId UUID format.' });
+      const projExists = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
+      if (!projExists) return res.status(404).json({ error: 'Referenced project not found.' });
+      validProjectId = projExists.id;
+    }
+
+    let validProductId: string | null = null;
+    if (productId !== undefined && productId !== null && productId !== '') {
+      if (!isUuid(productId)) return res.status(400).json({ error: 'Invalid productId UUID format.' });
+      const prodExists = await prisma.product.findUnique({ where: { id: productId }, select: { id: true } });
+      if (!prodExists) return res.status(404).json({ error: 'Referenced product not found.' });
+      validProductId = prodExists.id;
+    }
+
+    const installDateCheck = parseOptionalDate(installationDate, 'installationDate');
+    if (!installDateCheck.ok) return res.status(400).json({ error: installDateCheck.error });
+
+    const item = isUuid(id)
+      ? await prisma.installedItem.upsert({
+          where: { id },
+          update: {
+            title: cleanTitle,
+            serialNumber: serialNumber ?? null,
+            installationDate: installDateCheck.value ?? undefined,
+          },
+          create: {
+            id,
+            customerId,
+            projectId: validProjectId,
+            productId: validProductId,
+            title: cleanTitle,
+            serialNumber: serialNumber ?? null,
+            installationDate: installDateCheck.value ?? undefined,
+          },
+        })
+      : await prisma.installedItem.create({
+          data: {
+            customerId,
+            projectId: validProjectId,
+            productId: validProductId,
+            title: cleanTitle,
+            serialNumber: serialNumber ?? null,
+            installationDate: installDateCheck.value ?? undefined,
+          },
+        });
     res.json(item);
-  } catch (error: any) {
-    console.error('POST /api/installed-items error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/installed-items');
   }
 });
 
 app.delete('/api/installed-items/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.installedItem.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid installed item ID format.' });
+    }
+    await prisma.installedItem.delete({ where: { id } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/installed-items/:id');
   }
 });
 
 // Client Documents API
 app.get('/api/client-documents', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
+    const includeData = req.query.includeData === 'true';
+    const where: any = {};
+    if (req.query.customerId) {
+      if (!isUuid(req.query.customerId)) return res.status(400).json({ error: 'Invalid customerId filter.' });
+      where.customerId = req.query.customerId;
+    }
+    if (req.query.projectId) {
+      if (!isUuid(req.query.projectId)) return res.status(400).json({ error: 'Invalid projectId filter.' });
+      where.projectId = req.query.projectId;
+    }
+
     const docs = await prisma.clientDocument.findMany({
+      where,
+      include: { customer: true },
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
+    });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.clientDocument.count({ where })));
+    }
+    res.json(docs.map((d) => formatDocumentForList(d, includeData)));
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/client-documents');
+  }
+});
+
+// API-04: On-demand full document fetch (resolves Supabase Storage ref or returns stored data URL)
+app.get('/api/client-documents/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid document ID format.' });
+    }
+    const doc = await prisma.clientDocument.findUnique({
+      where: { id },
       include: { customer: true },
     });
-    res.json(docs);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (!doc) return res.status(404).json({ error: 'Document not found.' });
+
+    let resolvedUrl = doc.fileUrl;
+    if (isStorageRef(doc.fileUrl)) {
+      const bin = await resolveDocumentBinary(doc.fileUrl);
+      if (bin) {
+        resolvedUrl = `data:${bin.mime};base64,${bin.buffer.toString('base64')}`;
+      }
+    }
+    res.json({
+      ...doc,
+      fileUrl: resolvedUrl,
+      hasFile: Boolean(resolvedUrl && resolvedUrl !== '#'),
+    });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/client-documents/:id');
+  }
+});
+
+app.get('/api/client-documents/:id/download', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid document ID format.' });
+    }
+    const doc = await prisma.clientDocument.findUnique({ where: { id } });
+    if (!doc) return res.status(404).json({ error: 'Document not found.' });
+
+    const bin = await resolveDocumentBinary(doc.fileUrl);
+    if (!bin) {
+      return res.status(404).json({ error: 'Document file content is unavailable.' });
+    }
+    const safeDownloadName = (doc.fileName || doc.title || 'document').replace(/[^a-zA-Z0-9._-]/g, '_');
+    res.setHeader('Content-Type', bin.mime);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeDownloadName}"`);
+    res.send(bin.buffer);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/client-documents/:id/download');
   }
 });
 
 app.post('/api/client-documents', async (req, res) => {
   try {
-    const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl, fileName, sizeBytes } = req.body;
+    const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl, fileName, sizeBytes } = req.body ?? {};
 
     const uploadValidation = validateDocumentUpload(fileUrl, fileName || title);
     if (!uploadValidation.ok) {
       return res.status(400).json({ error: uploadValidation.error });
     }
 
-    const isUuid = (val?: string | null) =>
-      Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
-
     let validProjectId: string | null = null;
     let resolvedProject: { id: string; customerId: string; offerId: string } | null = null;
-    if (projectId) {
+    if (projectId !== undefined && projectId !== null && projectId !== '') {
       if (isUuid(projectId)) {
-        resolvedProject = await prisma.project
-          .findUnique({ where: { id: projectId }, select: { id: true, customerId: true, offerId: true } })
-          .catch(() => null);
+        resolvedProject = await prisma.project.findUnique({
+          where: { id: projectId },
+          select: { id: true, customerId: true, offerId: true },
+        });
+      } else {
+        resolvedProject = await prisma.project.findUnique({
+          where: { projectNumber: String(projectId) },
+          select: { id: true, customerId: true, offerId: true },
+        });
       }
       if (!resolvedProject) {
-        resolvedProject = await prisma.project
-          .findUnique({ where: { projectNumber: String(projectId) }, select: { id: true, customerId: true, offerId: true } })
-          .catch(() => null);
+        return res.status(404).json({ error: 'Referenced project not found.' });
       }
-      if (resolvedProject) {
-        validProjectId = resolvedProject.id;
-      }
+      validProjectId = resolvedProject.id;
     }
 
-    let validCustomerId = isUuid(customerId) ? customerId : null;
-    if (validCustomerId) {
-      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) validCustomerId = null;
-    }
-    if (!validCustomerId && resolvedProject?.customerId) {
-      validCustomerId = resolvedProject.customerId;
-    }
-    if (!validCustomerId) {
-      const firstCust = await prisma.customer.findFirst();
-      if (firstCust) {
-        validCustomerId = firstCust.id;
-      } else {
-        const newCust = await prisma.customer.create({ data: { name: 'Главен Клиент' } });
-        validCustomerId = newCust.id;
+    // API-01: Strictly require a real customerId (explicitly or derived from valid project)
+    let validCustomerId: string | null = null;
+    if (customerId !== undefined && customerId !== null && customerId !== '') {
+      if (!isUuid(customerId)) {
+        return res.status(400).json({ error: 'Invalid customerId UUID format.' });
       }
+      const custExists = await prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+      if (!custExists) {
+        return res.status(404).json({ error: 'Referenced customer not found.' });
+      }
+      validCustomerId = custExists.id;
+    } else if (resolvedProject?.customerId) {
+      validCustomerId = resolvedProject.customerId;
+    } else {
+      return res.status(400).json({ error: 'A valid customerId UUID (or valid projectId) is required.' });
     }
 
     let validOfferId: string | null = null;
-    if (isUuid(offerId)) {
-      const offExists = await prisma.offer.findUnique({ where: { id: offerId }, select: { id: true } }).catch(() => null);
-      if (offExists) validOfferId = offExists.id;
-    } else if (offerId) {
-      const offByNum = await prisma.offer
-        .findUnique({ where: { offerNumber: String(offerId) }, select: { id: true } })
-        .catch(() => null);
-      if (offByNum) validOfferId = offByNum.id;
-    }
-    if (!validOfferId && resolvedProject?.offerId) {
+    if (offerId !== undefined && offerId !== null && offerId !== '') {
+      const off = isUuid(offerId)
+        ? await prisma.offer.findUnique({ where: { id: offerId }, select: { id: true } })
+        : await prisma.offer.findUnique({ where: { offerNumber: String(offerId) }, select: { id: true } });
+      if (!off) return res.status(404).json({ error: 'Referenced offer not found.' });
+      validOfferId = off.id;
+    } else if (resolvedProject?.offerId) {
       validOfferId = resolvedProject.offerId;
     }
 
     let validServiceId: string | null = null;
-    if (isUuid(serviceId)) {
-      const srvExists = await prisma.serviceTicket
-        .findUnique({ where: { id: serviceId }, select: { id: true } })
-        .catch(() => null);
-      if (srvExists) validServiceId = srvExists.id;
+    if (serviceId !== undefined && serviceId !== null && serviceId !== '') {
+      if (!isUuid(serviceId)) return res.status(400).json({ error: 'Invalid serviceId UUID format.' });
+      const srvExists = await prisma.serviceTicket.findUnique({ where: { id: serviceId }, select: { id: true } });
+      if (!srvExists) return res.status(404).json({ error: 'Referenced service ticket not found.' });
+      validServiceId = srvExists.id;
     }
 
-    const parsedSize = sizeBytes !== undefined && sizeBytes !== null && !Number.isNaN(Number(sizeBytes)) ? Number(sizeBytes) : null;
+    // API-04: Persist file in Supabase Storage if configured, otherwise store validated data URL
+    const persisted = await persistDocumentPayload(String(fileUrl || ''), fileName || title);
+    const parsedSize =
+      sizeBytes !== undefined && sizeBytes !== null && Number.isFinite(Number(sizeBytes))
+        ? Math.max(0, Math.round(Number(sizeBytes)))
+        : persisted.sizeBytes ?? null;
 
-    let doc;
-    if (isUuid(id)) {
-      doc = await prisma.clientDocument.upsert({
-        where: { id },
-        update: {
-          title: title || 'Документ',
-          fileType: fileType || 'application/pdf',
-          fileUrl: fileUrl || '',
-          fileName: fileName || null,
-          sizeBytes: parsedSize,
-          offerId: validOfferId,
-          projectId: validProjectId,
-          serviceId: validServiceId,
-        },
-        create: {
-          id,
-          customerId: validCustomerId,
-          offerId: validOfferId,
-          projectId: validProjectId,
-          serviceId: validServiceId,
-          title: title || 'Документ',
-          fileType: fileType || 'application/pdf',
-          fileUrl: fileUrl || '',
-          fileName: fileName || null,
-          sizeBytes: parsedSize,
-        },
-      });
-    } else {
-      const existingDoc = await prisma.clientDocument
-        .findFirst({
-          where: {
+    // API-06: Always create a new document when no valid existing UUID is provided (never overwrite by title)
+    const doc = isUuid(id)
+      ? await prisma.clientDocument.upsert({
+          where: { id },
+          update: {
             title: title || 'Документ',
-            ...(validProjectId ? { projectId: validProjectId } : { customerId: validCustomerId }),
+            fileType: fileType || 'application/pdf',
+            fileUrl: persisted.storedUrl,
+            fileName: fileName || null,
+            sizeBytes: parsedSize,
+            offerId: validOfferId,
+            projectId: validProjectId,
+            serviceId: validServiceId,
+          },
+          create: {
+            id,
+            customerId: validCustomerId,
+            offerId: validOfferId,
+            projectId: validProjectId,
+            serviceId: validServiceId,
+            title: title || 'Документ',
+            fileType: fileType || 'application/pdf',
+            fileUrl: persisted.storedUrl,
+            fileName: fileName || null,
+            sizeBytes: parsedSize,
           },
         })
-        .catch(() => null);
-
-      if (existingDoc) {
-        doc = await prisma.clientDocument.update({
-          where: { id: existingDoc.id },
-          data: {
-            title: title || 'Документ',
-            fileType: fileType || existingDoc.fileType || 'application/pdf',
-            fileUrl: fileUrl || existingDoc.fileUrl || '',
-            fileName: fileName ?? existingDoc.fileName ?? null,
-            sizeBytes: parsedSize ?? existingDoc.sizeBytes ?? null,
-            offerId: validOfferId ?? existingDoc.offerId,
-            projectId: validProjectId ?? existingDoc.projectId,
-            serviceId: validServiceId ?? existingDoc.serviceId,
-          },
-        });
-      } else {
-        doc = await prisma.clientDocument.create({
+      : await prisma.clientDocument.create({
           data: {
             customerId: validCustomerId,
             offerId: validOfferId,
@@ -1694,124 +2044,121 @@ app.post('/api/client-documents', async (req, res) => {
             serviceId: validServiceId,
             title: title || 'Документ',
             fileType: fileType || 'application/pdf',
-            fileUrl: fileUrl || '',
+            fileUrl: persisted.storedUrl,
             fileName: fileName || null,
             sizeBytes: parsedSize,
           },
         });
-      }
-    }
-    res.json(doc);
-  } catch (error: any) {
-    console.error('POST /api/client-documents error:', error);
-    res.status(500).json({ error: error.message });
+
+    res.json({
+      ...doc,
+      hasFile: Boolean(doc.fileUrl && doc.fileUrl !== '#'),
+    });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/client-documents');
   }
 });
 
 app.delete('/api/client-documents/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.clientDocument.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid document ID format.' });
+    }
+    const deleted = await prisma.clientDocument.delete({ where: { id } });
+    await deleteStoredDocumentObject(deleted.fileUrl);
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/client-documents/:id');
   }
 });
 
 // Calendar Events API
 app.get('/api/calendar-events', async (req, res) => {
   try {
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
     const events = await prisma.calendarEvent.findMany({
-      include: {
-        customer: true,
-      },
+      include: { customer: true },
+      orderBy: { startDate: 'asc' },
+      ...buildPrismaPaginationArgs(page.value),
     });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.calendarEvent.count()));
+    }
     res.json(events);
-  } catch (error: any) {
-    console.error('GET /api/calendar-events database error:', error?.message || error);
-    res.json([]);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/calendar-events');
   }
 });
 
 app.post('/api/calendar-events', async (req, res) => {
   try {
-    const { id, title, description, startDate, endDate, allDay, eventType, customerId, projectId, location, color } = req.body;
+    const { id, title, description, startDate, endDate, allDay, eventType, customerId, projectId, location, color } =
+      req.body ?? {};
 
-    if (!title || !startDate) {
-      return res.status(400).json({ error: 'Title and startDate are required' });
+    const cleanTitle = typeof title === 'string' ? title.trim() : '';
+    if (!cleanTitle) {
+      return res.status(400).json({ error: 'title is required.' });
     }
 
-    let validCustomerId = customerId;
-    if (validCustomerId) {
-      const custExists = await prisma.customer.findUnique({ where: { id: validCustomerId } }).catch(() => null);
-      if (!custExists) validCustomerId = null;
+    const startCheck = parseIsoDateString(startDate, 'startDate', true);
+    if (!startCheck.ok || !startCheck.value) {
+      return res.status(400).json({ error: startCheck.ok ? 'startDate is required.' : startCheck.error });
+    }
+    const endCheck = parseIsoDateString(endDate, 'endDate', false);
+    if (!endCheck.ok) return res.status(400).json({ error: endCheck.error });
+
+    let validCustomerId: string | null = null;
+    if (customerId !== undefined && customerId !== null && customerId !== '') {
+      if (!isUuid(customerId)) return res.status(400).json({ error: 'Invalid customerId UUID format.' });
+      const custExists = await prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+      if (!custExists) return res.status(404).json({ error: 'Referenced customer not found.' });
+      validCustomerId = custExists.id;
     }
 
-    const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    const data = {
+      title: cleanTitle,
+      description: description ?? null,
+      startDate: startCheck.value,
+      endDate: endCheck.value,
+      allDay: Boolean(allDay),
+      eventType: eventType || 'MEETING',
+      customerId: validCustomerId,
+      projectId: projectId || null,
+      location: location ?? null,
+      color: color ?? null,
+    };
 
-    let event;
-    if (isUuid) {
-      event = await prisma.calendarEvent.upsert({
-        where: { id },
-        update: {
-          title,
-          description,
-          startDate,
-          endDate,
-          allDay: Boolean(allDay),
-          eventType: eventType || 'MEETING',
-          customerId: validCustomerId,
-          projectId: projectId || null,
-          location,
-          color,
-        },
-        create: {
-          id,
-          title,
-          description,
-          startDate,
-          endDate,
-          allDay: Boolean(allDay),
-          eventType: eventType || 'MEETING',
-          customerId: validCustomerId,
-          projectId: projectId || null,
-          location,
-          color,
-        },
-        include: { customer: true },
-      });
-    } else {
-      event = await prisma.calendarEvent.create({
-        data: {
-          title,
-          description,
-          startDate,
-          endDate,
-          allDay: Boolean(allDay),
-          eventType: eventType || 'MEETING',
-          customerId: validCustomerId,
-          projectId: projectId || null,
-          location,
-          color,
-        },
-        include: { customer: true },
-      });
-    }
+    const event = isUuid(id)
+      ? await prisma.calendarEvent.upsert({
+          where: { id },
+          update: data,
+          create: { id, ...data },
+          include: { customer: true },
+        })
+      : await prisma.calendarEvent.create({
+          data,
+          include: { customer: true },
+        });
 
     res.json(event);
-  } catch (error: any) {
-    console.error('POST /api/calendar-events error:', error?.message || error);
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/calendar-events');
   }
 });
 
 app.delete('/api/calendar-events/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.calendarEvent.delete({ where: { id } }).catch(() => null);
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid calendar event ID format.' });
+    }
+    await prisma.calendarEvent.delete({ where: { id } });
     res.json({ success: true, id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/calendar-events/:id');
   }
 });
 
@@ -1849,21 +2196,41 @@ const formatPaymentRecord = (p: any) => ({
 });
 
 // Purchase Invoices
-app.get('/api/purchase-invoices', async (_req, res) => {
+app.get('/api/purchase-invoices', async (req, res) => {
   try {
-    const rows = await prisma.purchaseInvoice.findMany({ orderBy: { createdAt: 'desc' } });
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
+    const rows = await prisma.purchaseInvoice.findMany({
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
+    });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.purchaseInvoice.count()));
+    }
     res.json(rows.map(formatPurchaseInvoice));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/purchase-invoices');
   }
 });
 
 app.post('/api/purchase-invoices', async (req, res) => {
   try {
-    const b = req.body;
+    const b = req.body ?? {};
     if (!b?.id || !b?.internalNumber) {
       return res.status(400).json({ error: 'id and internalNumber are required' });
     }
+    const taxRateCheck = parseFiniteNumber(b.taxRate, 'taxRate', { min: 0, max: 100, defaultVal: 18 });
+    if (!taxRateCheck.ok) return res.status(400).json({ error: taxRateCheck.error });
+    const subtotalCheck = parseFiniteNumber(b.subtotal, 'subtotal', { min: 0, defaultVal: 0 });
+    if (!subtotalCheck.ok) return res.status(400).json({ error: subtotalCheck.error });
+    const taxAmountCheck = parseFiniteNumber(b.taxAmount, 'taxAmount', { min: 0, defaultVal: 0 });
+    if (!taxAmountCheck.ok) return res.status(400).json({ error: taxAmountCheck.error });
+    const totalAmountCheck = parseFiniteNumber(b.totalAmount, 'totalAmount', { min: 0, defaultVal: 0 });
+    if (!totalAmountCheck.ok) return res.status(400).json({ error: totalAmountCheck.error });
+    const paidAmountCheck = parseFiniteNumber(b.paidAmount, 'paidAmount', { min: 0, defaultVal: 0 });
+    if (!paidAmountCheck.ok) return res.status(400).json({ error: paidAmountCheck.error });
+
     const data = {
       internalNumber: String(b.internalNumber),
       supplierInvoiceNumber: b.supplierInvoiceNumber ?? null,
@@ -1875,11 +2242,11 @@ app.post('/api/purchase-invoices', async (req, res) => {
       dueDate: b.dueDate ?? null,
       status: String(b.status || 'INVOICED'),
       receiptStatus: String(b.receiptStatus || 'PENDING'),
-      taxRate: Number(b.taxRate ?? 18),
-      subtotal: Number(b.subtotal ?? 0),
-      taxAmount: Number(b.taxAmount ?? 0),
-      totalAmount: Number(b.totalAmount ?? 0),
-      paidAmount: Number(b.paidAmount ?? 0),
+      taxRate: taxRateCheck.value,
+      subtotal: subtotalCheck.value,
+      taxAmount: taxAmountCheck.value,
+      totalAmount: totalAmountCheck.value,
+      paidAmount: paidAmountCheck.value,
       notes: b.notes ?? null,
       items: Array.isArray(b.items) ? b.items : [],
     };
@@ -1889,36 +2256,54 @@ app.post('/api/purchase-invoices', async (req, res) => {
       create: { id: String(b.id), ...data },
     });
     res.json(formatPurchaseInvoice(saved));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/purchase-invoices');
   }
 });
 
 app.delete('/api/purchase-invoices/:id', async (req, res) => {
   try {
-    await prisma.purchaseInvoice.delete({ where: { id: req.params.id } }).catch(() => null);
+    await prisma.purchaseInvoice.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/purchase-invoices/:id');
   }
 });
 
 // Sales Invoices
-app.get('/api/sales-invoices', async (_req, res) => {
+app.get('/api/sales-invoices', async (req, res) => {
   try {
-    const rows = await prisma.salesInvoice.findMany({ orderBy: { createdAt: 'desc' } });
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
+    const rows = await prisma.salesInvoice.findMany({
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
+    });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.salesInvoice.count()));
+    }
     res.json(rows.map(formatSalesInvoice));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/sales-invoices');
   }
 });
 
 app.post('/api/sales-invoices', async (req, res) => {
   try {
-    const b = req.body;
+    const b = req.body ?? {};
     if (!b?.id || !b?.invoiceNumber) {
       return res.status(400).json({ error: 'id and invoiceNumber are required' });
     }
+    const taxRateCheck = parseFiniteNumber(b.taxRate, 'taxRate', { min: 0, max: 100, defaultVal: 18 });
+    if (!taxRateCheck.ok) return res.status(400).json({ error: taxRateCheck.error });
+    const discountRateCheck = parseFiniteNumber(b.discountRate, 'discountRate', { min: 0, max: 100, defaultVal: 0 });
+    if (!discountRateCheck.ok) return res.status(400).json({ error: discountRateCheck.error });
+    const totalAmountCheck = parseFiniteNumber(b.totalAmount, 'totalAmount', { min: 0, defaultVal: 0 });
+    if (!totalAmountCheck.ok) return res.status(400).json({ error: totalAmountCheck.error });
+    const paidAmountCheck = parseFiniteNumber(b.paidAmount, 'paidAmount', { min: 0, defaultVal: 0 });
+    if (!paidAmountCheck.ok) return res.status(400).json({ error: paidAmountCheck.error });
+
     const data = {
       invoiceNumber: String(b.invoiceNumber),
       externalAccountingNumber: b.externalAccountingNumber ?? null,
@@ -1929,17 +2314,17 @@ app.post('/api/sales-invoices', async (req, res) => {
       projectId: b.projectId ?? null,
       issueDate: String(b.issueDate || new Date().toISOString().split('T')[0]),
       dueDate: b.dueDate ?? null,
-      taxRate: Number(b.taxRate ?? 18),
-      discountRate: Number(b.discountRate ?? 0),
-      discountAmount: Number(b.discountAmount ?? 0),
-      subtotal: Number(b.subtotal ?? 0),
-      taxAmount: Number(b.taxAmount ?? 0),
-      grossTotalAmount: Number(b.grossTotalAmount ?? 0),
+      taxRate: taxRateCheck.value,
+      discountRate: discountRateCheck.value,
+      discountAmount: Number(b.discountAmount ?? 0) || 0,
+      subtotal: Number(b.subtotal ?? 0) || 0,
+      taxAmount: Number(b.taxAmount ?? 0) || 0,
+      grossTotalAmount: Number(b.grossTotalAmount ?? 0) || 0,
       linkedAdvanceInvoiceId: b.linkedAdvanceInvoiceId ?? null,
       linkedAdvanceInvoiceNumber: b.linkedAdvanceInvoiceNumber ?? null,
-      advanceDeductedAmount: Number(b.advanceDeductedAmount ?? 0),
-      totalAmount: Number(b.totalAmount ?? 0),
-      paidAmount: Number(b.paidAmount ?? 0),
+      advanceDeductedAmount: Number(b.advanceDeductedAmount ?? 0) || 0,
+      totalAmount: totalAmountCheck.value,
+      paidAmount: paidAmountCheck.value,
       notes: b.notes ?? null,
       items: Array.isArray(b.items) ? b.items : [],
     };
@@ -1949,33 +2334,42 @@ app.post('/api/sales-invoices', async (req, res) => {
       create: { id: String(b.id), ...data },
     });
     res.json(formatSalesInvoice(saved));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/sales-invoices');
   }
 });
 
 app.delete('/api/sales-invoices/:id', async (req, res) => {
   try {
-    await prisma.salesInvoice.delete({ where: { id: req.params.id } }).catch(() => null);
+    await prisma.salesInvoice.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/sales-invoices/:id');
   }
 });
 
 // Dispatch Notes
-app.get('/api/dispatch-notes', async (_req, res) => {
+app.get('/api/dispatch-notes', async (req, res) => {
   try {
-    const rows = await prisma.dispatchNote.findMany({ orderBy: { createdAt: 'desc' } });
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
+    const rows = await prisma.dispatchNote.findMany({
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
+    });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.dispatchNote.count()));
+    }
     res.json(rows.map((r) => ({ ...r, items: Array.isArray(r.items) ? r.items : [] })));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/dispatch-notes');
   }
 });
 
 app.post('/api/dispatch-notes', async (req, res) => {
   try {
-    const b = req.body;
+    const b = req.body ?? {};
     if (!b?.id || !b?.dispatchNumber) {
       return res.status(400).json({ error: 'id and dispatchNumber are required' });
     }
@@ -2000,40 +2394,52 @@ app.post('/api/dispatch-notes', async (req, res) => {
       create: { id: String(b.id), ...data },
     });
     res.json({ ...saved, items: Array.isArray(saved.items) ? saved.items : [] });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/dispatch-notes');
   }
 });
 
 app.delete('/api/dispatch-notes/:id', async (req, res) => {
   try {
-    await prisma.dispatchNote.delete({ where: { id: req.params.id } }).catch(() => null);
+    await prisma.dispatchNote.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/dispatch-notes/:id');
   }
 });
 
 // Payments
-app.get('/api/payments', async (_req, res) => {
+app.get('/api/payments', async (req, res) => {
   try {
-    const rows = await prisma.paymentRecord.findMany({ orderBy: { createdAt: 'desc' } });
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
+    const rows = await prisma.paymentRecord.findMany({
+      orderBy: { createdAt: 'desc' },
+      ...buildPrismaPaginationArgs(page.value),
+    });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.paymentRecord.count()));
+    }
     res.json(rows.map(formatPaymentRecord));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/payments');
   }
 });
 
 app.post('/api/payments', async (req, res) => {
   try {
-    const b = req.body;
+    const b = req.body ?? {};
     if (!b?.id || !b?.paymentNumber) {
       return res.status(400).json({ error: 'id and paymentNumber are required' });
     }
+    const amountCheck = parseFiniteNumber(b.amount, 'amount', { min: 0, defaultVal: 0 });
+    if (!amountCheck.ok) return res.status(400).json({ error: amountCheck.error });
+
     const data = {
       paymentNumber: String(b.paymentNumber),
       direction: String(b.direction || 'IN'),
-      amount: Number(b.amount ?? 0),
+      amount: amountCheck.value,
       date: String(b.date || new Date().toISOString().split('T')[0]),
       method: String(b.method || 'BANK'),
       bankAccount: b.bankAccount ?? null,
@@ -2052,33 +2458,42 @@ app.post('/api/payments', async (req, res) => {
       create: { id: String(b.id), ...data },
     });
     res.json(formatPaymentRecord(saved));
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/payments');
   }
 });
 
 app.delete('/api/payments/:id', async (req, res) => {
   try {
-    await prisma.paymentRecord.delete({ where: { id: req.params.id } }).catch(() => null);
+    await prisma.paymentRecord.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/payments/:id');
   }
 });
 
 // Inventory Movements
-app.get('/api/inventory-movements', async (_req, res) => {
+app.get('/api/inventory-movements', async (req, res) => {
   try {
-    const rows = await prisma.inventoryMovement.findMany({ orderBy: { createdAt: 'desc' }, take: 500 });
+    const page = parsePagination(req.query as Record<string, unknown>);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
+    const rows = await prisma.inventoryMovement.findMany({
+      orderBy: { createdAt: 'desc' },
+      ...(page.value.isPaginated ? buildPrismaPaginationArgs(page.value) : { take: 500 }),
+    });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.inventoryMovement.count()));
+    }
     res.json(rows);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/inventory-movements');
   }
 });
 
 app.post('/api/inventory-movements', async (req, res) => {
   try {
-    const b = req.body;
+    const b = req.body ?? {};
     if (!b?.id || !b?.kind || !b?.detail) {
       return res.status(400).json({ error: 'id, kind, and detail are required' });
     }
@@ -2088,7 +2503,7 @@ app.post('/api/inventory-movements', async (req, res) => {
       productId: b.productId ?? null,
       projectId: b.projectId ?? null,
       offerId: b.offerId ?? null,
-      quantity: b.quantity !== undefined && b.quantity !== null ? Number(b.quantity) : null,
+      quantity: b.quantity !== undefined && b.quantity !== null && Number.isFinite(Number(b.quantity)) ? Math.round(Number(b.quantity)) : null,
       at: String(b.at || new Date().toISOString()),
     };
     const saved = await prisma.inventoryMovement.upsert({
@@ -2097,8 +2512,8 @@ app.post('/api/inventory-movements', async (req, res) => {
       create: { id: String(b.id), ...data },
     });
     res.json(saved);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/inventory-movements');
   }
 });
 
@@ -2110,8 +2525,8 @@ app.get('/api/company-settings', async (_req, res) => {
       settings = await prisma.companySettings.create({ data: { id: 'default' } });
     }
     res.json(settings);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/company-settings');
   }
 });
 
@@ -2135,8 +2550,8 @@ app.put('/api/company-settings', requireRole('SUPER_ADMIN'), async (req, res) =>
       create: { id: 'default', ...updateData },
     });
     res.json(settings);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+  } catch (error) {
+    return handleRouteError(res, error, 'PUT /api/company-settings');
   }
 });
 

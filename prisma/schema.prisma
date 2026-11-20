@@ -95,6 +95,10 @@ model Product {
   code              String             @unique
   description       String?
   isActive          Boolean            @default(true) @map("is_active")
+  stockType         String             @default("STOCK") @map("stock_type")
+  stockQuantity     Int                @default(0) @map("stock_quantity")
+  reservedQuantity  Int                @default(0) @map("reserved_quantity")
+  purchasePrice     Decimal            @default(0.00) @map("purchase_price") @db.Decimal(10, 2)
   createdAt         DateTime           @default(now()) @map("created_at")
   models            ProductModel[]
   specificationKeys SpecificationKey[]
@@ -246,6 +250,7 @@ model Project {
   installationContact  String?       @map("installation_contact")
   installationMinutes  String?       @map("installation_minutes")
   signatureUrl         String?       @map("signature_url")
+  workflowData         Json?         @map("workflow_data")
   createdAt            DateTime      @default(now()) @map("created_at")
   documents            ClientDocument[]
   installedItems       InstalledItem[]
@@ -322,10 +327,133 @@ model CalendarEvent {
   eventType   String    @default("MEETING") @map("event_type")
   customerId  String?   @map("customer_id") @db.Uuid
   customer    Customer? @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  projectId   String?   @map("project_id")
   location    String?
   color       String?
   createdAt   DateTime  @default(now()) @map("created_at")
 
   @@map("calendar_events")
+}
+
+model PurchaseInvoice {
+  id                    String   @id
+  internalNumber        String   @unique @map("internal_number")
+  supplierInvoiceNumber String?  @map("supplier_invoice_number")
+  supplierId            String   @map("supplier_id")
+  supplierName          String   @map("supplier_name")
+  projectId             String?  @map("project_id")
+  offerId               String?  @map("offer_id")
+  issueDate             String   @map("issue_date")
+  dueDate               String?  @map("due_date")
+  status                String   @default("INVOICED")
+  receiptStatus         String   @default("PENDING") @map("receipt_status")
+  taxRate               Decimal  @default(18.00) @map("tax_rate") @db.Decimal(5, 2)
+  subtotal              Decimal  @default(0.00) @db.Decimal(12, 2)
+  taxAmount             Decimal  @default(0.00) @map("tax_amount") @db.Decimal(12, 2)
+  totalAmount           Decimal  @default(0.00) @map("total_amount") @db.Decimal(12, 2)
+  paidAmount            Decimal  @default(0.00) @map("paid_amount") @db.Decimal(12, 2)
+  notes                 String?
+  items                 Json     @default("[]")
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  @@map("purchase_invoices")
+}
+
+model SalesInvoice {
+  id                         String   @id
+  invoiceNumber              String   @unique @map("invoice_number")
+  externalAccountingNumber   String?  @map("external_accounting_number")
+  invoiceType                String   @map("invoice_type")
+  status                     String   @default("ISSUED")
+  customerId                 String   @map("customer_id")
+  offerId                    String?  @map("offer_id")
+  projectId                  String?  @map("project_id")
+  issueDate                  String   @map("issue_date")
+  dueDate                    String?  @map("due_date")
+  taxRate                    Decimal  @default(18.00) @map("tax_rate") @db.Decimal(5, 2)
+  discountRate               Decimal  @default(0.00) @map("discount_rate") @db.Decimal(5, 2)
+  discountAmount             Decimal  @default(0.00) @map("discount_amount") @db.Decimal(12, 2)
+  subtotal                   Decimal  @default(0.00) @db.Decimal(12, 2)
+  taxAmount                  Decimal  @default(0.00) @map("tax_amount") @db.Decimal(12, 2)
+  grossTotalAmount           Decimal  @default(0.00) @map("gross_total_amount") @db.Decimal(12, 2)
+  linkedAdvanceInvoiceId     String?  @map("linked_advance_invoice_id")
+  linkedAdvanceInvoiceNumber String?  @map("linked_advance_invoice_number")
+  advanceDeductedAmount      Decimal  @default(0.00) @map("advance_deducted_amount") @db.Decimal(12, 2)
+  totalAmount                Decimal  @default(0.00) @map("total_amount") @db.Decimal(12, 2)
+  paidAmount                 Decimal  @default(0.00) @map("paid_amount") @db.Decimal(12, 2)
+  notes                      String?
+  items                      Json     @default("[]")
+  createdAt                  DateTime @default(now()) @map("created_at")
+
+  @@map("sales_invoices")
+}
+
+model DispatchNote {
+  id              String   @id
+  dispatchNumber  String   @unique @map("dispatch_number")
+  status          String   @default("DRAFT")
+  customerId      String   @map("customer_id")
+  projectId       String?  @map("project_id")
+  offerId         String?  @map("offer_id")
+  salesInvoiceId  String?  @map("sales_invoice_id")
+  issueDate       String   @map("issue_date")
+  deliveryAddress String?  @map("delivery_address")
+  receivedBy      String?  @map("received_by")
+  issuedBy        String?  @map("issued_by")
+  notes           String?
+  items           Json     @default("[]")
+  stockDeducted   Boolean  @default(false) @map("stock_deducted")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@map("dispatch_notes")
+}
+
+model PaymentRecord {
+  id                String   @id
+  paymentNumber     String   @unique @map("payment_number")
+  direction         String
+  amount            Decimal  @default(0.00) @db.Decimal(12, 2)
+  date              String
+  method            String   @default("BANK")
+  bankAccount       String?  @map("bank_account")
+  customerId        String?  @map("customer_id")
+  partnerName       String?  @map("partner_name")
+  projectId         String?  @map("project_id")
+  offerId           String?  @map("offer_id")
+  salesInvoiceId    String?  @map("sales_invoice_id")
+  purchaseInvoiceId String?  @map("purchase_invoice_id")
+  isAdvance         Boolean  @default(false) @map("is_advance")
+  notes             String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@map("payment_records")
+}
+
+model InventoryMovement {
+  id        String   @id
+  kind      String
+  detail    String
+  productId String?  @map("product_id")
+  projectId String?  @map("project_id")
+  offerId   String?  @map("offer_id")
+  quantity  Int?
+  at        String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("inventory_movements")
+}
+
+model CompanySettings {
+  id                    String   @id @default("default")
+  companyName           String   @default("ИМФЕКС ЕКСПОРТ-ИМПОРТ ДООЕЛ") @map("company_name")
+  address               String   @default("Ул. Качанички Пат бб, Скопје")
+  taxId                 String   @default("MK4030012345678") @map("tax_id")
+  phone                 String   @default("+389 2 3123 456")
+  email                 String   @default("info@imfex.com")
+  bankAccount           String?  @map("bank_account")
+  defaultAdvancePercent Int      @default(50) @map("default_advance_percent")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@map("company_settings")
 }
 

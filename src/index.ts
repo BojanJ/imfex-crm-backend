@@ -3,10 +3,19 @@ import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { Resend } from 'resend';
+import {
+  SAFE_PROFILE_SELECT,
+  AuthenticatedRequest,
+  createRequireAuth,
+  requireRole,
+  signAuthToken,
+  stripPasswordHash,
+} from './auth';
 
 const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 4000;
+const requireAuth = createRequireAuth(prisma);
 
 // Initialize Resend Email Service
 const resendApiKey = process.env.RESEND_API_KEY || '';
@@ -67,9 +76,79 @@ app.get('/', (req, res) => {
   });
 });
 
-// Admin Database Cleanup & UTF-8 Sync Endpoint
-app.all('/api/admin/clean-database', async (req, res) => {
+// ==========================================
+// PUBLIC AUTHENTICATION ENDPOINT
+// ==========================================
+
+app.post('/api/auth/login', async (req, res) => {
   try {
+    const { email, password } = req.body ?? {};
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    const cleanPassword = typeof password === 'string' ? password : '';
+
+    if (!cleanEmail || !cleanPassword) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const user = await prisma.profile.findUnique({
+      where: { email: cleanEmail },
+    });
+
+    if (!user || user.status === 'DISABLED' || !user.passwordHash) {
+      return res.status(401).json({ error: 'Invalid credentials or account disabled' });
+    }
+
+    const isValid = await bcrypt.compare(cleanPassword, user.passwordHash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = signAuthToken(user);
+    res.json({
+      token,
+      user: stripPasswordHash(user),
+    });
+  } catch (error: any) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// ==========================================
+// GLOBAL AUTHENTICATION MIDDLEWARE FOR /api/*
+// ==========================================
+app.use('/api', requireAuth);
+
+// Verify current authenticated session
+app.get('/api/auth/me', (req: AuthenticatedRequest, res) => {
+  res.json({ user: req.user });
+});
+
+// ==========================================
+// PROTECTED ADMIN MAINTENANCE ENDPOINTS
+// ==========================================
+function isAdminDbToolsAllowed(): boolean {
+  if (process.env.NODE_ENV === 'production') {
+    return process.env.ALLOW_ADMIN_DB_TOOLS === 'true';
+  }
+  return true;
+}
+
+// Admin Database Cleanup & UTF-8 Sync Endpoint (POST + SUPER_ADMIN + explicit confirmation)
+app.post('/api/admin/clean-database', requireRole('SUPER_ADMIN'), async (req, res) => {
+  try {
+    if (!isAdminDbToolsAllowed()) {
+      return res.status(403).json({
+        error: 'Admin database maintenance endpoints are disabled in production.',
+      });
+    }
+
+    if (req.body?.confirm !== 'CLEAN_DATABASE') {
+      return res.status(400).json({
+        error: 'Explicit confirmation { "confirm": "CLEAN_DATABASE" } is required.',
+      });
+    }
+
     const allCust = await prisma.customer.findMany();
     const corruptedCust = allCust.filter(
       (c) => (c.name && c.name.includes('?')) || (c.companyName && c.companyName.includes('?'))
@@ -94,9 +173,29 @@ app.all('/api/admin/clean-database', async (req, res) => {
   }
 });
 
-// Admin Fresh Database Wipe Endpoint (0 records, 1 System User)
-app.all('/api/admin/reset-database', async (req, res) => {
+// Admin Fresh Database Wipe Endpoint (POST + SUPER_ADMIN + explicit confirmation + disabled in prod)
+app.post('/api/admin/reset-database', requireRole('SUPER_ADMIN'), async (req: AuthenticatedRequest, res) => {
   try {
+    if (!isAdminDbToolsAllowed()) {
+      return res.status(403).json({
+        error: 'Admin database reset endpoint is disabled in production.',
+      });
+    }
+
+    if (req.body?.confirm !== 'RESET_DATABASE') {
+      return res.status(400).json({
+        error: 'Explicit confirmation { "confirm": "RESET_DATABASE" } is required.',
+      });
+    }
+
+    const currentAdmin = await prisma.profile.findUnique({
+      where: { id: req.user!.id },
+    });
+
+    if (!currentAdmin || !currentAdmin.passwordHash) {
+      return res.status(400).json({ error: 'Active super admin account not found.' });
+    }
+
     await prisma.offerItemSpecification.deleteMany();
     await prisma.offerItem.deleteMany();
     await prisma.offer.deleteMany();
@@ -105,6 +204,11 @@ app.all('/api/admin/reset-database', async (req, res) => {
     await prisma.installedItem.deleteMany();
     await prisma.clientDocument.deleteMany();
     await prisma.calendarEvent.deleteMany();
+    await prisma.paymentRecord.deleteMany();
+    await prisma.dispatchNote.deleteMany();
+    await prisma.salesInvoice.deleteMany();
+    await prisma.purchaseInvoice.deleteMany();
+    await prisma.inventoryMovement.deleteMany();
     await prisma.customer.deleteMany();
     await prisma.specificationOption.deleteMany();
     await prisma.specificationKey.deleteMany();
@@ -112,35 +216,16 @@ app.all('/api/admin/reset-database', async (req, res) => {
     await prisma.product.deleteMany();
     await prisma.productCategory.deleteMany();
 
+    // Preserve the executing SUPER_ADMIN account and its existing password hash
     await prisma.profile.deleteMany({
       where: {
-        email: { notIn: ['admin@imfex.com'] },
-      },
-    });
-
-    const adminPasswordHash = bcrypt.hashSync('admin123', 10);
-
-    await prisma.profile.upsert({
-      where: { email: 'admin@imfex.com' },
-      update: {
-        passwordHash: adminPasswordHash,
-        mustChangePassword: false,
-        status: 'ACTIVE',
-      },
-      create: {
-        id: '11111111-1111-1111-1111-111111111111',
-        email: 'admin@imfex.com',
-        fullName: 'Супер Администратор',
-        role: 'SUPER_ADMIN',
-        passwordHash: adminPasswordHash,
-        mustChangePassword: false,
-        status: 'ACTIVE',
+        id: { not: currentAdmin.id },
       },
     });
 
     res.json({
       success: true,
-      message: 'Database reset cleanly to fresh state. 0 records, 1 system user active (admin@imfex.com).',
+      message: `Database reset cleanly to fresh state. 0 records, 1 system user active (${currentAdmin.email}).`,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -233,7 +318,7 @@ app.post('/api/email/send-offer', async (req, res) => {
 });
 
 // 2. Send Welcome & Temporary Password Email to New User
-app.post('/api/email/welcome-user', async (req, res) => {
+app.post('/api/email/welcome-user', requireRole('SUPER_ADMIN'), async (req, res) => {
   try {
     const { to, fullName, tempPassword, role } = req.body;
 
@@ -293,7 +378,7 @@ app.post('/api/email/welcome-user', async (req, res) => {
 });
 
 // 3. Send Password Reset Email
-app.post('/api/email/reset-password', async (req, res) => {
+app.post('/api/email/reset-password', requireRole('SUPER_ADMIN'), async (req, res) => {
   try {
     const { to, tempPassword } = req.body;
 
@@ -348,55 +433,14 @@ app.post('/api/email/reset-password', async (req, res) => {
 });
 
 // ==========================================
-// EXISTING CRUD & AUTH ENDPOINTS
+// EXISTING CRUD ENDPOINTS (PROTECTED BY requireAuth)
 // ==========================================
-
-// Auth API
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
-    }
-
-    const user = await prisma.profile.findUnique({
-      where: { email: email.toLowerCase() },
-    });
-
-    if (!user || user.status === 'DISABLED') {
-      return res.status(401).json({ error: 'Invalid credentials or account disabled' });
-    }
-
-    if (user.passwordHash && password) {
-      const isValid = bcrypt.compareSync(password, user.passwordHash);
-      if (!isValid) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
-    }
-
-    const { passwordHash, ...userWithoutPassword } = user;
-    res.json({
-      token: `jwt-imfex-${user.id}-${Date.now()}`,
-      user: userWithoutPassword,
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // Profiles / User Accounts API
 app.get('/api/profiles', async (req, res) => {
   try {
     const profiles = await prisma.profile.findMany({
-      select: {
-        id: true,
-        email: true,
-        fullName: true,
-        role: true,
-        mustChangePassword: true,
-        status: true,
-        createdAt: true,
-      },
+      select: SAFE_PROFILE_SELECT,
     });
     res.json(profiles);
   } catch (error: any) {
@@ -404,21 +448,25 @@ app.get('/api/profiles', async (req, res) => {
   }
 });
 
-app.post('/api/profiles', async (req, res) => {
+app.post('/api/profiles', requireRole('SUPER_ADMIN'), async (req, res) => {
   try {
     const { email, fullName, role, password } = req.body;
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'Valid email is required' });
+    }
     const passwordHash = password ? bcrypt.hashSync(password, 10) : bcrypt.hashSync('IMFEX2026!', 10);
     const profile = await prisma.profile.upsert({
-      where: { email: email.toLowerCase() },
+      where: { email: email.trim().toLowerCase() },
       update: { fullName, role, status: 'ACTIVE' },
       create: {
-        email: email.toLowerCase(),
+        email: email.trim().toLowerCase(),
         fullName,
         role: role || 'USER',
         passwordHash,
         mustChangePassword: true,
         status: 'ACTIVE',
       },
+      select: SAFE_PROFILE_SELECT,
     });
     res.json(profile);
   } catch (error: any) {
@@ -426,14 +474,25 @@ app.post('/api/profiles', async (req, res) => {
   }
 });
 
-app.put('/api/profiles/:id', async (req, res) => {
+app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
   try {
-    const { id } = req.params;
+    const id = String(req.params.id);
+    const isSuperAdmin = req.user?.role === 'SUPER_ADMIN';
+    const isSelf = req.user?.id === id;
+
+    if (!isSuperAdmin && !isSelf) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
     const { fullName, role, status, password } = req.body;
     const updateData: any = {};
     if (fullName !== undefined) updateData.fullName = fullName;
-    if (role !== undefined) updateData.role = role;
-    if (status !== undefined) updateData.status = status;
+    if (isSuperAdmin) {
+      if (role !== undefined) updateData.role = role;
+      if (status !== undefined) updateData.status = status;
+    } else if (role !== undefined || status !== undefined) {
+      return res.status(403).json({ error: 'Only SUPER_ADMIN can modify role or status' });
+    }
     if (password) {
       updateData.passwordHash = bcrypt.hashSync(password, 10);
       updateData.mustChangePassword = false;
@@ -442,17 +501,20 @@ app.put('/api/profiles/:id', async (req, res) => {
     const profile = await prisma.profile.update({
       where: { id },
       data: updateData,
+      select: SAFE_PROFILE_SELECT,
     });
-    const { passwordHash, ...userWithoutPassword } = profile;
-    res.json(userWithoutPassword);
+    res.json(profile);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.delete('/api/profiles/:id', async (req, res) => {
+app.delete('/api/profiles/:id', requireRole('SUPER_ADMIN'), async (req: AuthenticatedRequest, res) => {
   try {
-    const { id } = req.params;
+    const id = String(req.params.id);
+    if (req.user?.id === id) {
+      return res.status(400).json({ error: 'Cannot delete your own active account' });
+    }
     await prisma.profile.delete({ where: { id } }).catch(() => null);
     res.json({ success: true, id });
   } catch (error: any) {
@@ -507,6 +569,28 @@ app.delete('/api/categories/:id', async (req, res) => {
   }
 });
 
+const formatProductForResponse = (p: any) => {
+  if (!p) return p;
+  return {
+    ...p,
+    stockType: p.stockType || 'STOCK',
+    stockQuantity: Number(p.stockQuantity ?? 0),
+    reservedQuantity: Number(p.reservedQuantity ?? 0),
+    purchasePrice: Number(p.purchasePrice ?? 0),
+    models: (p.models || []).map((m: any) => ({
+      ...m,
+      basePrice: Number(m.basePrice ?? 0),
+    })),
+    specificationKeys: (p.specificationKeys || []).map((sk: any) => ({
+      ...sk,
+      options: (sk.options || []).map((opt: any) => ({
+        ...opt,
+        priceModifier: Number(opt.priceModifier ?? 0),
+      })),
+    })),
+  };
+};
+
 // Products API
 app.get('/api/products', async (req, res) => {
   try {
@@ -521,7 +605,7 @@ app.get('/api/products', async (req, res) => {
         },
       },
     });
-    res.json(products);
+    res.json(products.map(formatProductForResponse));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -529,11 +613,31 @@ app.get('/api/products', async (req, res) => {
 
 app.post('/api/products', async (req, res) => {
   try {
-    const { id, name, code, description, isActive, models, specificationKeys, categoryId } = req.body;
+    const {
+      id,
+      name,
+      code,
+      description,
+      isActive,
+      stockType,
+      stockQuantity,
+      reservedQuantity,
+      purchasePrice,
+      models,
+      specificationKeys,
+      categoryId,
+    } = req.body;
 
     if (!code) {
       return res.status(400).json({ error: 'Product code is required' });
     }
+
+    const stockFields = {
+      ...(stockType !== undefined ? { stockType } : {}),
+      ...(stockQuantity !== undefined ? { stockQuantity: Math.max(0, Math.round(Number(stockQuantity) || 0)) } : {}),
+      ...(reservedQuantity !== undefined ? { reservedQuantity: Math.max(0, Math.round(Number(reservedQuantity) || 0)) } : {}),
+      ...(purchasePrice !== undefined ? { purchasePrice: Number(purchasePrice) || 0 } : {}),
+    };
 
     const isUuid = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
     let product;
@@ -547,6 +651,7 @@ app.post('/api/products', async (req, res) => {
           description,
           isActive: isActive !== undefined ? isActive : true,
           categoryId: categoryId || null,
+          ...stockFields,
         },
         create: {
           id,
@@ -555,6 +660,7 @@ app.post('/api/products', async (req, res) => {
           description,
           isActive: isActive !== undefined ? isActive : true,
           categoryId: categoryId || null,
+          ...stockFields,
         },
         include: {
           category: true,
@@ -570,6 +676,7 @@ app.post('/api/products', async (req, res) => {
           description,
           isActive: isActive !== undefined ? isActive : true,
           categoryId: categoryId || null,
+          ...stockFields,
         },
         create: {
           name,
@@ -577,6 +684,7 @@ app.post('/api/products', async (req, res) => {
           description,
           isActive: isActive !== undefined ? isActive : true,
           categoryId: categoryId || null,
+          ...stockFields,
         },
         include: {
           category: true,
@@ -720,7 +828,7 @@ app.post('/api/products', async (req, res) => {
       include: { category: true, models: true, specificationKeys: { include: { options: true } } },
     });
 
-    res.json(updatedProduct);
+    res.json(formatProductForResponse(updatedProduct));
   } catch (error: any) {
     if (error.code === 'P2002') {
       return res.status(400).json({ error: 'Product with this code already exists.' });
@@ -822,7 +930,7 @@ app.get('/api/offers', async (req, res) => {
     const offers = await prisma.offer.findMany({
       include: {
         customer: true,
-        createdByUser: true,
+        createdByUser: { select: SAFE_PROFILE_SELECT },
         items: {
           include: {
             offerItemSpecifications: true,
@@ -842,7 +950,7 @@ app.get('/api/offers/:id', async (req, res) => {
       where: { id: req.params.id },
       include: {
         customer: true,
-        createdByUser: true,
+        createdByUser: { select: SAFE_PROFILE_SELECT },
         items: {
           include: {
             offerItemSpecifications: true,
@@ -871,6 +979,7 @@ app.post('/api/offers', async (req, res) => {
       subtotal,
       taxAmount,
       totalAmount,
+      validUntil,
       items,
     } = req.body;
 
@@ -923,6 +1032,7 @@ app.post('/api/offers', async (req, res) => {
           subtotal: subtotal !== undefined ? Number(subtotal) : existingOffer.subtotal,
           taxAmount: taxAmount !== undefined ? Number(taxAmount) : existingOffer.taxAmount,
           totalAmount: totalAmount !== undefined ? Number(totalAmount) : existingOffer.totalAmount,
+          ...(validUntil !== undefined ? { validUntil: validUntil ? new Date(validUntil) : null } : {}),
         },
       });
     } else {
@@ -948,12 +1058,13 @@ app.post('/api/offers', async (req, res) => {
           customerId: validCustomerId,
           createdByUserId: validUserId,
           status: status || 'DRAFT',
-          taxRate: taxRate ? Number(taxRate) : 18.0,
-          discountRate: discountRate ? Number(discountRate) : 0.0,
-          discountAmount: discountAmount ? Number(discountAmount) : 0.0,
-          subtotal: subtotal ? Number(subtotal) : 0.0,
-          taxAmount: taxAmount ? Number(taxAmount) : 0.0,
-          totalAmount: totalAmount ? Number(totalAmount) : 0.0,
+          taxRate: taxRate !== undefined && taxRate !== null ? Number(taxRate) : 18.0,
+          discountRate: discountRate !== undefined && discountRate !== null ? Number(discountRate) : 0.0,
+          discountAmount: discountAmount !== undefined && discountAmount !== null ? Number(discountAmount) : 0.0,
+          subtotal: subtotal !== undefined && subtotal !== null ? Number(subtotal) : 0.0,
+          taxAmount: taxAmount !== undefined && taxAmount !== null ? Number(taxAmount) : 0.0,
+          totalAmount: totalAmount !== undefined && totalAmount !== null ? Number(totalAmount) : 0.0,
+          validUntil: validUntil ? new Date(validUntil) : null,
         },
       });
     }
@@ -1026,7 +1137,7 @@ app.post('/api/offers', async (req, res) => {
       where: { id: offer.id },
       include: {
         customer: true,
-        createdByUser: true,
+        createdByUser: { select: SAFE_PROFILE_SELECT },
         items: {
           include: {
             offerItemSpecifications: true,
@@ -1052,6 +1163,54 @@ app.delete('/api/offers/:id', async (req, res) => {
   }
 });
 
+const WORKFLOW_KEYS = [
+  'acceptedAt',
+  'advancePaid',
+  'advancePaidAt',
+  'supplierOrdered',
+  'supplierOrderedAt',
+  'warehouseReceived',
+  'warehouseReceivedAt',
+  'dispatchIssued',
+  'dispatchIssuedAt',
+  'selectedMotorId',
+  'selectedRailId',
+  'reservedAccessoryIds',
+  'missingAccessoryNames',
+] as const;
+
+const extractWorkflowData = (body: any) => {
+  const wf: Record<string, any> = {};
+  let hasAny = false;
+  for (const key of WORKFLOW_KEYS) {
+    if (body[key] !== undefined) {
+      wf[key] = body[key];
+      hasAny = true;
+    }
+  }
+  return hasAny ? wf : undefined;
+};
+
+const formatProjectForResponse = (project: any) => {
+  if (!project) return project;
+  const wf = project.workflowData && typeof project.workflowData === 'object' ? project.workflowData : {};
+  return {
+    ...wf,
+    ...project,
+    offer: project.offer
+      ? {
+          ...project.offer,
+          taxRate: Number(project.offer.taxRate || 0),
+          discountRate: Number(project.offer.discountRate || 0),
+          discountAmount: Number(project.offer.discountAmount || 0),
+          subtotal: Number(project.offer.subtotal || 0),
+          taxAmount: Number(project.offer.taxAmount || 0),
+          totalAmount: Number(project.offer.totalAmount || 0),
+        }
+      : project.offer,
+  };
+};
+
 // Projects API
 app.get('/api/projects', async (req, res) => {
   try {
@@ -1059,12 +1218,12 @@ app.get('/api/projects', async (req, res) => {
       include: {
         customer: true,
         offer: true,
-        responsibleUser: true,
+        responsibleUser: { select: SAFE_PROFILE_SELECT },
         installedItems: true,
         documents: true,
       },
     });
-    res.json(projects);
+    res.json(projects.map(formatProjectForResponse));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -1077,13 +1236,13 @@ app.get('/api/projects/:id', async (req, res) => {
       include: {
         customer: true,
         offer: true,
-        responsibleUser: true,
+        responsibleUser: { select: SAFE_PROFILE_SELECT },
         installedItems: true,
         documents: true,
       },
     });
     if (!project) return res.status(404).json({ error: 'Project not found' });
-    res.json(project);
+    res.json(formatProjectForResponse(project));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -1148,6 +1307,20 @@ app.post('/api/projects', async (req, res) => {
       if (!userExists) validRespUser = null;
     }
 
+    const existingProj = await prisma.project.findUnique({
+      where: { projectNumber },
+      select: { workflowData: true },
+    }).catch(() => null);
+    const incomingWorkflow = extractWorkflowData(req.body);
+    const mergedWorkflowData = incomingWorkflow
+      ? {
+          ...(existingProj?.workflowData && typeof existingProj.workflowData === 'object'
+            ? (existingProj.workflowData as Record<string, any>)
+            : {}),
+          ...incomingWorkflow,
+        }
+      : undefined;
+
     const project = await prisma.project.upsert({
       where: { projectNumber },
       update: {
@@ -1164,6 +1337,7 @@ app.post('/api/projects', async (req, res) => {
         installationContact,
         installationMinutes,
         signatureUrl,
+        ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
       },
       create: {
         projectNumber,
@@ -1182,10 +1356,11 @@ app.post('/api/projects', async (req, res) => {
         installationContact,
         installationMinutes,
         signatureUrl,
+        ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
       },
-      include: { customer: true, offer: true, responsibleUser: true },
+      include: { customer: true, offer: true, responsibleUser: { select: SAFE_PROFILE_SELECT } },
     });
-    res.json(project);
+    res.json(formatProjectForResponse(project));
   } catch (error: any) {
     console.error('POST /api/projects error:', error);
     res.status(500).json({ error: error.message });
@@ -1218,7 +1393,7 @@ app.get('/api/service-tickets', async (req, res) => {
       include: {
         customer: true,
         installedItem: true,
-        assignedTechnician: true,
+        assignedTechnician: { select: SAFE_PROFILE_SELECT },
       },
     });
     res.json(tickets.map(formatTicketForResponse));
@@ -1234,7 +1409,7 @@ app.get('/api/service-tickets/:id', async (req, res) => {
       include: {
         customer: true,
         installedItem: true,
-        assignedTechnician: true,
+        assignedTechnician: { select: SAFE_PROFILE_SELECT },
       },
     });
     if (!ticket) return res.status(404).json({ error: 'Service ticket not found' });
@@ -1313,7 +1488,7 @@ app.post('/api/service-tickets', async (req, res) => {
         partsConsumed,
         closedAt: closedAt ? new Date(closedAt) : undefined,
       },
-      include: { customer: true, installedItem: true, assignedTechnician: true },
+      include: { customer: true, installedItem: true, assignedTechnician: { select: SAFE_PROFILE_SELECT } },
     });
     res.json(ticket);
   } catch (error: any) {
@@ -1569,7 +1744,7 @@ app.get('/api/calendar-events', async (req, res) => {
 
 app.post('/api/calendar-events', async (req, res) => {
   try {
-    const { id, title, description, startDate, endDate, allDay, eventType, customerId, location, color } = req.body;
+    const { id, title, description, startDate, endDate, allDay, eventType, customerId, projectId, location, color } = req.body;
 
     if (!title || !startDate) {
       return res.status(400).json({ error: 'Title and startDate are required' });
@@ -1595,6 +1770,7 @@ app.post('/api/calendar-events', async (req, res) => {
           allDay: Boolean(allDay),
           eventType: eventType || 'MEETING',
           customerId: validCustomerId,
+          projectId: projectId || null,
           location,
           color,
         },
@@ -1607,6 +1783,7 @@ app.post('/api/calendar-events', async (req, res) => {
           allDay: Boolean(allDay),
           eventType: eventType || 'MEETING',
           customerId: validCustomerId,
+          projectId: projectId || null,
           location,
           color,
         },
@@ -1622,6 +1799,7 @@ app.post('/api/calendar-events', async (req, res) => {
           allDay: Boolean(allDay),
           eventType: eventType || 'MEETING',
           customerId: validCustomerId,
+          projectId: projectId || null,
           location,
           color,
         },
@@ -1641,6 +1819,331 @@ app.delete('/api/calendar-events/:id', async (req, res) => {
     const { id } = req.params;
     await prisma.calendarEvent.delete({ where: { id } }).catch(() => null);
     res.json({ success: true, id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// FINANCE, INVENTORY & COMPANY SETTINGS APIs
+// ==========================================
+
+const formatPurchaseInvoice = (inv: any) => ({
+  ...inv,
+  taxRate: Number(inv.taxRate ?? 18),
+  subtotal: Number(inv.subtotal ?? 0),
+  taxAmount: Number(inv.taxAmount ?? 0),
+  totalAmount: Number(inv.totalAmount ?? 0),
+  paidAmount: Number(inv.paidAmount ?? 0),
+  items: Array.isArray(inv.items) ? inv.items : [],
+});
+
+const formatSalesInvoice = (inv: any) => ({
+  ...inv,
+  taxRate: Number(inv.taxRate ?? 18),
+  discountRate: Number(inv.discountRate ?? 0),
+  discountAmount: Number(inv.discountAmount ?? 0),
+  subtotal: Number(inv.subtotal ?? 0),
+  taxAmount: Number(inv.taxAmount ?? 0),
+  grossTotalAmount: Number(inv.grossTotalAmount ?? 0),
+  advanceDeductedAmount: Number(inv.advanceDeductedAmount ?? 0),
+  totalAmount: Number(inv.totalAmount ?? 0),
+  paidAmount: Number(inv.paidAmount ?? 0),
+  items: Array.isArray(inv.items) ? inv.items : [],
+});
+
+const formatPaymentRecord = (p: any) => ({
+  ...p,
+  amount: Number(p.amount ?? 0),
+});
+
+// Purchase Invoices
+app.get('/api/purchase-invoices', async (_req, res) => {
+  try {
+    const rows = await prisma.purchaseInvoice.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json(rows.map(formatPurchaseInvoice));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/purchase-invoices', async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b?.id || !b?.internalNumber) {
+      return res.status(400).json({ error: 'id and internalNumber are required' });
+    }
+    const data = {
+      internalNumber: String(b.internalNumber),
+      supplierInvoiceNumber: b.supplierInvoiceNumber ?? null,
+      supplierId: String(b.supplierId || ''),
+      supplierName: String(b.supplierName || 'Добавувач'),
+      projectId: b.projectId ?? null,
+      offerId: b.offerId ?? null,
+      issueDate: String(b.issueDate || new Date().toISOString().split('T')[0]),
+      dueDate: b.dueDate ?? null,
+      status: String(b.status || 'INVOICED'),
+      receiptStatus: String(b.receiptStatus || 'PENDING'),
+      taxRate: Number(b.taxRate ?? 18),
+      subtotal: Number(b.subtotal ?? 0),
+      taxAmount: Number(b.taxAmount ?? 0),
+      totalAmount: Number(b.totalAmount ?? 0),
+      paidAmount: Number(b.paidAmount ?? 0),
+      notes: b.notes ?? null,
+      items: Array.isArray(b.items) ? b.items : [],
+    };
+    const saved = await prisma.purchaseInvoice.upsert({
+      where: { id: String(b.id) },
+      update: data,
+      create: { id: String(b.id), ...data },
+    });
+    res.json(formatPurchaseInvoice(saved));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/purchase-invoices/:id', async (req, res) => {
+  try {
+    await prisma.purchaseInvoice.delete({ where: { id: req.params.id } }).catch(() => null);
+    res.json({ success: true, id: req.params.id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Sales Invoices
+app.get('/api/sales-invoices', async (_req, res) => {
+  try {
+    const rows = await prisma.salesInvoice.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json(rows.map(formatSalesInvoice));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/sales-invoices', async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b?.id || !b?.invoiceNumber) {
+      return res.status(400).json({ error: 'id and invoiceNumber are required' });
+    }
+    const data = {
+      invoiceNumber: String(b.invoiceNumber),
+      externalAccountingNumber: b.externalAccountingNumber ?? null,
+      invoiceType: String(b.invoiceType || 'FINAL'),
+      status: String(b.status || 'ISSUED'),
+      customerId: String(b.customerId || ''),
+      offerId: b.offerId ?? null,
+      projectId: b.projectId ?? null,
+      issueDate: String(b.issueDate || new Date().toISOString().split('T')[0]),
+      dueDate: b.dueDate ?? null,
+      taxRate: Number(b.taxRate ?? 18),
+      discountRate: Number(b.discountRate ?? 0),
+      discountAmount: Number(b.discountAmount ?? 0),
+      subtotal: Number(b.subtotal ?? 0),
+      taxAmount: Number(b.taxAmount ?? 0),
+      grossTotalAmount: Number(b.grossTotalAmount ?? 0),
+      linkedAdvanceInvoiceId: b.linkedAdvanceInvoiceId ?? null,
+      linkedAdvanceInvoiceNumber: b.linkedAdvanceInvoiceNumber ?? null,
+      advanceDeductedAmount: Number(b.advanceDeductedAmount ?? 0),
+      totalAmount: Number(b.totalAmount ?? 0),
+      paidAmount: Number(b.paidAmount ?? 0),
+      notes: b.notes ?? null,
+      items: Array.isArray(b.items) ? b.items : [],
+    };
+    const saved = await prisma.salesInvoice.upsert({
+      where: { id: String(b.id) },
+      update: data,
+      create: { id: String(b.id), ...data },
+    });
+    res.json(formatSalesInvoice(saved));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/sales-invoices/:id', async (req, res) => {
+  try {
+    await prisma.salesInvoice.delete({ where: { id: req.params.id } }).catch(() => null);
+    res.json({ success: true, id: req.params.id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Dispatch Notes
+app.get('/api/dispatch-notes', async (_req, res) => {
+  try {
+    const rows = await prisma.dispatchNote.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json(rows.map((r) => ({ ...r, items: Array.isArray(r.items) ? r.items : [] })));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/dispatch-notes', async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b?.id || !b?.dispatchNumber) {
+      return res.status(400).json({ error: 'id and dispatchNumber are required' });
+    }
+    const data = {
+      dispatchNumber: String(b.dispatchNumber),
+      status: String(b.status || 'DRAFT'),
+      customerId: String(b.customerId || ''),
+      projectId: b.projectId ?? null,
+      offerId: b.offerId ?? null,
+      salesInvoiceId: b.salesInvoiceId ?? null,
+      issueDate: String(b.issueDate || new Date().toISOString().split('T')[0]),
+      deliveryAddress: b.deliveryAddress ?? null,
+      receivedBy: b.receivedBy ?? null,
+      issuedBy: b.issuedBy ?? null,
+      notes: b.notes ?? null,
+      items: Array.isArray(b.items) ? b.items : [],
+      stockDeducted: Boolean(b.stockDeducted),
+    };
+    const saved = await prisma.dispatchNote.upsert({
+      where: { id: String(b.id) },
+      update: data,
+      create: { id: String(b.id), ...data },
+    });
+    res.json({ ...saved, items: Array.isArray(saved.items) ? saved.items : [] });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/dispatch-notes/:id', async (req, res) => {
+  try {
+    await prisma.dispatchNote.delete({ where: { id: req.params.id } }).catch(() => null);
+    res.json({ success: true, id: req.params.id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Payments
+app.get('/api/payments', async (_req, res) => {
+  try {
+    const rows = await prisma.paymentRecord.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json(rows.map(formatPaymentRecord));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/payments', async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b?.id || !b?.paymentNumber) {
+      return res.status(400).json({ error: 'id and paymentNumber are required' });
+    }
+    const data = {
+      paymentNumber: String(b.paymentNumber),
+      direction: String(b.direction || 'IN'),
+      amount: Number(b.amount ?? 0),
+      date: String(b.date || new Date().toISOString().split('T')[0]),
+      method: String(b.method || 'BANK'),
+      bankAccount: b.bankAccount ?? null,
+      customerId: b.customerId ?? null,
+      partnerName: b.partnerName ?? null,
+      projectId: b.projectId ?? null,
+      offerId: b.offerId ?? null,
+      salesInvoiceId: b.salesInvoiceId ?? null,
+      purchaseInvoiceId: b.purchaseInvoiceId ?? null,
+      isAdvance: Boolean(b.isAdvance),
+      notes: b.notes ?? null,
+    };
+    const saved = await prisma.paymentRecord.upsert({
+      where: { id: String(b.id) },
+      update: data,
+      create: { id: String(b.id), ...data },
+    });
+    res.json(formatPaymentRecord(saved));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/payments/:id', async (req, res) => {
+  try {
+    await prisma.paymentRecord.delete({ where: { id: req.params.id } }).catch(() => null);
+    res.json({ success: true, id: req.params.id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Inventory Movements
+app.get('/api/inventory-movements', async (_req, res) => {
+  try {
+    const rows = await prisma.inventoryMovement.findMany({ orderBy: { createdAt: 'desc' }, take: 500 });
+    res.json(rows);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/inventory-movements', async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b?.id || !b?.kind || !b?.detail) {
+      return res.status(400).json({ error: 'id, kind, and detail are required' });
+    }
+    const data = {
+      kind: String(b.kind),
+      detail: String(b.detail),
+      productId: b.productId ?? null,
+      projectId: b.projectId ?? null,
+      offerId: b.offerId ?? null,
+      quantity: b.quantity !== undefined && b.quantity !== null ? Number(b.quantity) : null,
+      at: String(b.at || new Date().toISOString()),
+    };
+    const saved = await prisma.inventoryMovement.upsert({
+      where: { id: String(b.id) },
+      update: data,
+      create: { id: String(b.id), ...data },
+    });
+    res.json(saved);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Company Settings
+app.get('/api/company-settings', async (_req, res) => {
+  try {
+    let settings = await prisma.companySettings.findUnique({ where: { id: 'default' } });
+    if (!settings) {
+      settings = await prisma.companySettings.create({ data: { id: 'default' } });
+    }
+    res.json(settings);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/company-settings', requireRole('SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { companyName, address, taxId, phone, email, bankAccount, defaultAdvancePercent } = req.body ?? {};
+    const updateData = {
+      ...(companyName !== undefined ? { companyName: String(companyName) } : {}),
+      ...(address !== undefined ? { address: String(address) } : {}),
+      ...(taxId !== undefined ? { taxId: String(taxId) } : {}),
+      ...(phone !== undefined ? { phone: String(phone) } : {}),
+      ...(email !== undefined ? { email: String(email) } : {}),
+      ...(bankAccount !== undefined ? { bankAccount: bankAccount ? String(bankAccount) : null } : {}),
+      ...(defaultAdvancePercent !== undefined
+        ? { defaultAdvancePercent: Math.min(100, Math.max(0, Math.round(Number(defaultAdvancePercent) || 50))) }
+        : {}),
+    };
+    const settings = await prisma.companySettings.upsert({
+      where: { id: 'default' },
+      update: updateData,
+      create: { id: 'default', ...updateData },
+    });
+    res.json(settings);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

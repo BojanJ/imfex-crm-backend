@@ -135,7 +135,51 @@ export function verifyAuthToken(token: string): AuthTokenPayload | null {
   }
 }
 
+const AUTH_USER_CACHE_TTL_MS = 30_000;
+const authUserCache = new Map<string, { user: SafeUserProfile | null; expiresAt: number }>();
+const inFlightUserLookups = new Map<string, Promise<SafeUserProfile | null>>();
+
+export function invalidateAuthUserCache(userId?: string) {
+  if (userId) {
+    authUserCache.delete(userId);
+  } else {
+    authUserCache.clear();
+  }
+}
+
 export function createRequireAuth(prisma: PrismaClient) {
+  async function loadAuthenticatedUser(userId: string): Promise<SafeUserProfile | null> {
+    const now = Date.now();
+    const cached = authUserCache.get(userId);
+    if (cached && cached.expiresAt > now) {
+      return cached.user;
+    }
+
+    const existingPromise = inFlightUserLookups.get(userId);
+    if (existingPromise) {
+      return existingPromise;
+    }
+
+    const lookupPromise = prisma.profile
+      .findUnique({
+        where: { id: userId },
+        select: SAFE_PROFILE_SELECT,
+      })
+      .then((user) => {
+        if (authUserCache.size > 1000) {
+          authUserCache.clear();
+        }
+        authUserCache.set(userId, { user, expiresAt: Date.now() + AUTH_USER_CACHE_TTL_MS });
+        return user;
+      })
+      .finally(() => {
+        inFlightUserLookups.delete(userId);
+      });
+
+    inFlightUserLookups.set(userId, lookupPromise);
+    return lookupPromise;
+  }
+
   return async function requireAuth(
     req: AuthenticatedRequest,
     res: Response,
@@ -162,10 +206,7 @@ export function createRequireAuth(prisma: PrismaClient) {
     }
 
     try {
-      const user = await prisma.profile.findUnique({
-        where: { id: payload.sub },
-        select: SAFE_PROFILE_SELECT,
-      });
+      const user = await loadAuthenticatedUser(payload.sub);
 
       if (!user || user.status === 'DISABLED') {
         return res.status(401).json({ error: 'Account not found or disabled' });

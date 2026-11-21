@@ -7,6 +7,7 @@ import {
   SAFE_PROFILE_SELECT,
   AuthenticatedRequest,
   createRequireAuth,
+  invalidateAuthUserCache,
   requireRole,
   signAuthToken,
   stripPasswordHash,
@@ -46,8 +47,41 @@ import {
   isStorageRef,
 } from './storage';
 
+function buildPooledDatabaseUrl(rawUrl?: string): string | undefined {
+  if (!rawUrl) return undefined;
+  try {
+    const parsed = new URL(rawUrl);
+    // Supabase Session Mode Pooler (port 5432) caps total clients at 15 on Free/Nano plans.
+    // Upgrade runtime app queries automatically to Transaction Mode Pooler (port 6543) with pgbouncer=true.
+    if (
+      parsed.hostname.endsWith('.pooler.supabase.com') &&
+      (parsed.port === '5432' || parsed.port === '') &&
+      process.env.DISABLE_SUPABASE_TX_POOLER !== 'true'
+    ) {
+      parsed.port = '6543';
+      parsed.searchParams.set('pgbouncer', 'true');
+      parsed.searchParams.set('statement_cache_size', '0');
+    }
+    const desiredLimit = String(
+      Math.max(1, Math.min(10, Number(process.env.PRISMA_CONNECTION_LIMIT) || 5))
+    );
+    if (!parsed.searchParams.has('connection_limit')) {
+      parsed.searchParams.set('connection_limit', desiredLimit);
+    }
+    if (!parsed.searchParams.has('pool_timeout')) {
+      parsed.searchParams.set('pool_timeout', '30');
+    }
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
 const app = express();
-const prisma = new PrismaClient();
+const pooledDbUrl = buildPooledDatabaseUrl(process.env.DATABASE_URL);
+const prisma = new PrismaClient(
+  pooledDbUrl ? { datasources: { db: { url: pooledDbUrl } } } : undefined
+);
 const PORT = process.env.PORT || 4000;
 const requireAuth = createRequireAuth(prisma);
 
@@ -189,6 +223,7 @@ app.post('/api/auth/change-password', passwordLimiter, async (req: Authenticated
       data: { passwordHash: nextHash, mustChangePassword: false },
       select: SAFE_PROFILE_SELECT,
     });
+    invalidateAuthUserCache(user.id);
 
     res.json({ success: true, user: updated });
   } catch (error: any) {
@@ -295,6 +330,7 @@ app.post('/api/admin/reset-database', requireRole('SUPER_ADMIN'), async (req: Au
         id: { not: currentAdmin.id },
       },
     });
+    invalidateAuthUserCache();
 
     res.json({
       success: true,
@@ -516,6 +552,7 @@ app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
       data: updateData,
       select: SAFE_PROFILE_SELECT,
     });
+    invalidateAuthUserCache(id);
     res.json(profile);
   } catch (error) {
     return handleRouteError(res, error, 'PUT /api/profiles/:id');
@@ -532,6 +569,7 @@ app.delete('/api/profiles/:id', requireRole('SUPER_ADMIN'), async (req: Authenti
       return res.status(400).json({ error: 'Cannot delete your own active account' });
     }
     await prisma.profile.delete({ where: { id } });
+    invalidateAuthUserCache(id);
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/profiles/:id');
@@ -2565,6 +2603,21 @@ app.put('/api/company-settings', requireRole('SUPER_ADMIN'), async (req, res) =>
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`🚀 IMFEX CRM Express Backend running on port ${PORT}`);
 });
+
+const shutdown = async (signal: string) => {
+  console.log(`[${signal}] Shutting down gracefully...`);
+  server.close(async () => {
+    await prisma.$disconnect().catch(() => {});
+    process.exit(0);
+  });
+  setTimeout(async () => {
+    await prisma.$disconnect().catch(() => {});
+    process.exit(1);
+  }, 5000).unref();
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

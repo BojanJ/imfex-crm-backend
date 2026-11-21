@@ -34,7 +34,7 @@ export function createApp() {
   const standardJson = express.json({ limit: '1mb' });
   const largeJson = express.json({ limit: '15mb' });
   app.use((req, res, next) => {
-    if (req.path === '/api/email/send-offer' || req.path === '/api/client-documents') {
+    if (req.path.startsWith('/api/email/') || req.path === '/api/client-documents') {
       return largeJson(req, res, next);
     }
     return standardJson(req, res, next);

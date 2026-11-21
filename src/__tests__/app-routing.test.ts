@@ -63,6 +63,13 @@ describe('Modular Express App & Routing (IMP-01)', () => {
     for (const res of responses) {
       expect(res.status).toBe(401);
     }
+
+    const invoiceEmailRes = await fetch(`${baseUrl}/api/email/send-invoice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'client@example.com', invoiceNumber: 'FAK-2026-0001' }),
+    });
+    expect(invoiceEmailRes.status).toBe(401);
   });
 
   it('validates public auth endpoints before hitting DB', async () => {

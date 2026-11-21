@@ -1,4 +1,5 @@
 import type { Response } from 'express';
+import { logger } from './logger';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -176,7 +177,11 @@ export function buildPrismaPaginationArgs(p: PaginationParams): {
  */
 export function handleRouteError(res: Response, error: unknown, context: string) {
   const err = error as { code?: string; meta?: { target?: unknown; field_name?: string }; message?: string };
-  console.error(`[${context}]`, error);
+  logger.error('route_error', {
+    context,
+    code: err?.code || null,
+    error: err?.message || String(error),
+  });
 
   if (err?.code === 'P2025') {
     return res.status(404).json({ error: 'Record not found.' });

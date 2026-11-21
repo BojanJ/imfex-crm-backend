@@ -68,9 +68,10 @@ model Profile {
   status             String          @default("ACTIVE")
   role               UserRole        @default(USER)
   createdAt          DateTime        @default(now()) @map("created_at")
-  offers             Offer[]
-  managedProjects    Project[]       @relation("ProjectResponsible")
-  assignedServices   ServiceTicket[] @relation("ServiceTechnician")
+  offers              Offer[]
+  managedProjects     Project[]            @relation("ProjectResponsible")
+  assignedServices    ServiceTicket[]      @relation("ServiceTechnician")
+  passwordResetTokens PasswordResetToken[]
 
   @@map("profiles")
 }
@@ -501,5 +502,36 @@ model CompanySettings {
   updatedAt             DateTime @updatedAt @map("updated_at")
 
   @@map("company_settings")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  profileId String    @map("profile_id") @db.Uuid
+  profile   Profile   @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([profileId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  actorEmail  String?  @map("actor_email")
+  action      String
+  entityType  String   @map("entity_type")
+  entityId    String?  @map("entity_id")
+  metadata    Json?
+  ipAddress   String?  @map("ip_address")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([actorUserId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
 }
 

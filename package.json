@@ -6,6 +6,7 @@
     "start": "node dist/index.js",
     "dev": "npx tsx --env-file=.env src/index.ts",
     "build": "prisma generate && tsc",
+    "test": "vitest run",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
@@ -30,6 +31,7 @@
     "@types/node": "^22.10.2",
     "prisma": "6.4.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^5.1.1"
   }
 }

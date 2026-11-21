@@ -46,6 +46,9 @@ import {
   formatDocumentForList,
   isStorageRef,
 } from './storage';
+import { logger, requestLogger } from './logger';
+import { recordAudit } from './audit';
+import { generateResetToken, hashResetToken, buildResetPasswordUrl } from './password-reset';
 
 function buildPooledDatabaseUrl(rawUrl?: string): string | undefined {
   if (!rawUrl) return undefined;
@@ -112,6 +115,7 @@ const EMAIL_FROM = process.env.EMAIL_FROM || 'IMFEX CRM <onboarding@resend.dev>'
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(securityHeaders);
+app.use(requestLogger);
 app.use(cors(buildCorsOptions()));
 
 // Keep global body limit tight (1mb); allow 15mb only on PDF email & document upload routes
@@ -173,13 +177,156 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     }
 
     const token = signAuthToken(user);
+    void recordAudit(prisma, undefined, {
+      action: 'AUTH_LOGIN',
+      entityType: 'Profile',
+      entityId: user.id,
+      actorUserId: user.id,
+      actorEmail: user.email,
+      ipAddress: typeof req.headers['x-forwarded-for'] === 'string'
+        ? req.headers['x-forwarded-for'].split(',')[0].trim()
+        : req.ip || null,
+    });
     res.json({
       token,
       user: stripPasswordHash(user),
     });
   } catch (error: any) {
-    console.error('Login error:', error);
+    logger.error('login_error', { error: error?.message || String(error) });
     res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// Public Forgot Password Endpoint (IMP-06) — always returns generic 200 to prevent account enumeration
+app.post('/api/auth/forgot-password', passwordLimiter, async (req, res) => {
+  try {
+    const cleanEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({ error: 'Please provide a valid email address.' });
+    }
+
+    const genericResponse = {
+      success: true,
+      message: 'If an active account exists for this email, password reset instructions have been sent.',
+    };
+
+    const user = await prisma.profile.findUnique({ where: { email: cleanEmail } });
+    if (!user || user.status === 'DISABLED') {
+      return res.json(genericResponse);
+    }
+
+    const { rawToken, tokenHash, expiresAt } = generateResetToken();
+    await prisma.passwordResetToken.create({
+      data: {
+        profileId: user.id,
+        tokenHash,
+        expiresAt,
+      },
+    });
+
+    const resetUrl = buildResetPasswordUrl(rawToken);
+    if (resend) {
+      const company = await prisma.companySettings.findUnique({ where: { id: 'default' } }).catch(() => null);
+      const safeCompanyName = escapeHtml(company?.companyName || 'IMFEX CRM');
+      const safeUserName = escapeHtml(user.fullName || user.email);
+      const safeResetUrl = escapeHtml(resetUrl);
+
+      await resend.emails.send({
+        from: EMAIL_FROM,
+        to: [user.email],
+        subject: `Ресетирање на лозинка - ${company?.companyName || 'IMFEX CRM'}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #1e293b;">
+            <div style="background-color: #0f172a; padding: 20px; text-align: center; border-radius: 12px 12px 0 0;">
+              <h1 style="color: #ffffff; margin: 0; font-size: 18px;">${safeCompanyName}</h1>
+            </div>
+            <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px;">
+              <p style="font-size: 14px; font-weight: 700;">Почитувани ${safeUserName},</p>
+              <p style="font-size: 13px;">Примивме барање за ресетирање на вашата лозинка. Кликнете на копчето подолу за да поставите нова лозинка (линкот важи 1 час):</p>
+              <p style="text-align: center; margin: 24px 0;">
+                <a href="${safeResetUrl}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: 700; font-size: 13px;">Ресетирај лозинка</a>
+              </p>
+              <p style="font-size: 11px; color: #64748b;">Доколку не сте го побарале ова, слободно игнорирајте ја оваа порака.</p>
+            </div>
+          </div>
+        `,
+      }).catch((err) => {
+        logger.error('forgot_password_email_error', { error: err?.message || String(err) });
+      });
+    } else {
+      logger.warn('forgot_password_email_skipped_no_resend', { profileId: user.id });
+    }
+
+    void recordAudit(prisma, undefined, {
+      action: 'PASSWORD_RESET_REQUESTED',
+      entityType: 'Profile',
+      entityId: user.id,
+      actorUserId: user.id,
+      actorEmail: user.email,
+      ipAddress: typeof req.headers['x-forwarded-for'] === 'string'
+        ? req.headers['x-forwarded-for'].split(',')[0].trim()
+        : req.ip || null,
+    });
+
+    return res.json(genericResponse);
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/auth/forgot-password');
+  }
+});
+
+// Public Reset Password Endpoint (IMP-06) — validates single-use SHA-256 token and sets new password
+app.post('/api/auth/reset-password', passwordLimiter, async (req, res) => {
+  try {
+    const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+
+    if (!rawToken || rawToken.length < 16) {
+      return res.status(400).json({ error: 'Invalid or missing reset token.' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters long.' });
+    }
+
+    const tokenHash = hashResetToken(rawToken);
+    const record = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { profile: true },
+    });
+
+    if (!record || record.usedAt || record.expiresAt.getTime() <= Date.now()) {
+      return res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
+    }
+    if (record.profile.status === 'DISABLED') {
+      return res.status(403).json({ error: 'Account is disabled.' });
+    }
+
+    const nextHash = await bcrypt.hash(newPassword, 10);
+    await prisma.$transaction([
+      prisma.profile.update({
+        where: { id: record.profileId },
+        data: { passwordHash: nextHash, mustChangePassword: false },
+      }),
+      prisma.passwordResetToken.update({
+        where: { id: record.id },
+        data: { usedAt: new Date() },
+      }),
+    ]);
+
+    invalidateAuthUserCache(record.profileId);
+    void recordAudit(prisma, undefined, {
+      action: 'PASSWORD_RESET_COMPLETED',
+      entityType: 'Profile',
+      entityId: record.profileId,
+      actorUserId: record.profileId,
+      actorEmail: record.profile.email,
+      ipAddress: typeof req.headers['x-forwarded-for'] === 'string'
+        ? req.headers['x-forwarded-for'].split(',')[0].trim()
+        : req.ip || null,
+    });
+
+    return res.json({ success: true, message: 'Password has been reset successfully.' });
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/auth/reset-password');
   }
 });
 
@@ -224,6 +371,7 @@ app.post('/api/auth/change-password', passwordLimiter, async (req: Authenticated
       select: SAFE_PROFILE_SELECT,
     });
     invalidateAuthUserCache(user.id);
+    void recordAudit(prisma, req, { action: 'PASSWORD_CHANGED', entityType: 'Profile', entityId: user.id });
 
     res.json({ success: true, user: updated });
   } catch (error: any) {
@@ -496,6 +644,12 @@ app.post('/api/profiles', requireRole('SUPER_ADMIN'), async (req, res) => {
       },
       select: SAFE_PROFILE_SELECT,
     });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'PROFILE_UPSERTED',
+      entityType: 'Profile',
+      entityId: profile.id,
+      metadata: { email: profile.email, role: profile.role },
+    });
     res.json(profile);
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/profiles');
@@ -553,6 +707,7 @@ app.put('/api/profiles/:id', async (req: AuthenticatedRequest, res) => {
       select: SAFE_PROFILE_SELECT,
     });
     invalidateAuthUserCache(id);
+    void recordAudit(prisma, req, { action: 'PROFILE_UPDATED', entityType: 'Profile', entityId: id });
     res.json(profile);
   } catch (error) {
     return handleRouteError(res, error, 'PUT /api/profiles/:id');
@@ -570,6 +725,7 @@ app.delete('/api/profiles/:id', requireRole('SUPER_ADMIN'), async (req: Authenti
     }
     await prisma.profile.delete({ where: { id } });
     invalidateAuthUserCache(id);
+    void recordAudit(prisma, req, { action: 'PROFILE_DELETED', entityType: 'Profile', entityId: id });
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/profiles/:id');
@@ -1347,6 +1503,12 @@ app.post('/api/offers', async (req, res) => {
       { timeout: 20000 }
     );
 
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'OFFER_SAVED',
+      entityType: 'Offer',
+      entityId: fullOffer?.id,
+      metadata: { offerNumber: fullOffer?.offerNumber, status: fullOffer?.status },
+    });
     res.json(formatOfferForResponse(fullOffer));
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/offers');
@@ -1360,6 +1522,7 @@ app.delete('/api/offers/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid offer ID format.' });
     }
     await prisma.offer.delete({ where: { id } });
+    void recordAudit(prisma, req as AuthenticatedRequest, { action: 'OFFER_DELETED', entityType: 'Offer', entityId: id });
     res.json({ success: true, id });
   } catch (error: any) {
     if (error?.code === 'P2003') {
@@ -1605,6 +1768,12 @@ app.post('/api/projects', async (req, res) => {
       },
       include: { customer: true, offer: true, responsibleUser: { select: SAFE_PROFILE_SELECT } },
     });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'PROJECT_SAVED',
+      entityType: 'Project',
+      entityId: project.id,
+      metadata: { projectNumber: project.projectNumber, status: project.status },
+    });
     res.json(formatProjectForResponse(project));
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/projects');
@@ -1618,6 +1787,7 @@ app.delete('/api/projects/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid project ID format.' });
     }
     await prisma.project.delete({ where: { id } });
+    void recordAudit(prisma, req as AuthenticatedRequest, { action: 'PROJECT_DELETED', entityType: 'Project', entityId: id });
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/projects/:id');
@@ -2597,14 +2767,38 @@ app.put('/api/company-settings', requireRole('SUPER_ADMIN'), async (req, res) =>
       update: updateData,
       create: { id: 'default', ...updateData },
     });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'COMPANY_SETTINGS_UPDATED',
+      entityType: 'CompanySettings',
+      entityId: 'default',
+    });
     res.json(settings);
   } catch (error) {
     return handleRouteError(res, error, 'PUT /api/company-settings');
   }
 });
 
+// Audit Logs (IMP-07, SUPER_ADMIN only)
+app.get('/api/audit-logs', requireRole('SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = parsePagination(req.query as Record<string, unknown>, 200);
+    if (!page.ok) return res.status(400).json({ error: page.error });
+
+    const logs = await prisma.auditLog.findMany({
+      orderBy: { createdAt: 'desc' },
+      ...(page.value.isPaginated ? buildPrismaPaginationArgs(page.value) : { take: 100 }),
+    });
+    if (page.value.isPaginated) {
+      res.setHeader('X-Total-Count', String(await prisma.auditLog.count()));
+    }
+    res.json(logs);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/audit-logs');
+  }
+});
+
 const server = app.listen(PORT, () => {
-  console.log(`🚀 IMFEX CRM Express Backend running on port ${PORT}`);
+  logger.info('server_started', { port: Number(PORT) || PORT });
 });
 
 const shutdown = async (signal: string) => {

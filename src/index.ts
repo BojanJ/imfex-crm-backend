@@ -324,6 +324,16 @@ app.post('/api/email/send-offer', emailLimiter, async (req, res) => {
       });
     }
 
+    const company = await prisma.companySettings.findUnique({ where: { id: 'default' } }).catch(() => null);
+    const companyName = company?.companyName || 'ИМФЕКС ЕКСПОРТ-ИМПОРТ ДООЕЛ';
+    const companyAddress = company?.address || 'Ул. Качанички Пат бб, Скопје';
+    const companyPhone = company?.phone || '+389 2 3123 456';
+    const companyEmail = company?.email || 'info@imfex.com';
+
+    const safeCompanyName = escapeHtml(companyName);
+    const safeCompanyAddress = escapeHtml(companyAddress);
+    const safeCompanyPhone = escapeHtml(companyPhone);
+    const safeCompanyEmail = escapeHtml(companyEmail);
     const safeOfferNumber = escapeHtml(offerNumber || '');
     const safeCustomerName = escapeHtml(customerName || 'Клиент');
     const safeCustomMessage = customMessage ? escapeHtml(customMessage) : '';
@@ -349,7 +359,7 @@ app.post('/api/email/send-offer', emailLimiter, async (req, res) => {
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b; line-height: 1.6;">
         <div style="background-color: #0f172a; padding: 24px; text-align: center; border-radius: 12px 12px 0 0;">
           <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">
-            ИМФЕКС ЕКСПОРТ-ИМПОРТ ДООЕЛ
+            ${safeCompanyName}
           </h1>
           <p style="color: #94a3b8; margin: 4px 0 0 0; font-size: 12px;">Комерцијална Понуда • ${safeOfferNumber}</p>
         </div>
@@ -373,8 +383,8 @@ app.post('/api/email/send-offer', emailLimiter, async (req, res) => {
           </p>
 
           <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #64748b; text-align: center;">
-            <p style="margin: 0; font-weight: 700;">ИМФЕКС ЕКСПОРТ-ИМПОРТ ДООЕЛ Скопје</p>
-            <p style="margin: 2px 0 0 0;">Ул. Качанички Пат бб, Скопје | Тел: +389 2 3123 456 | Email: info@imfex.com</p>
+            <p style="margin: 0; font-weight: 700;">${safeCompanyName}</p>
+            <p style="margin: 2px 0 0 0;">${safeCompanyAddress} | Тел: ${safeCompanyPhone} | Email: ${safeCompanyEmail}</p>
           </div>
         </div>
       </div>
@@ -383,7 +393,7 @@ app.post('/api/email/send-offer', emailLimiter, async (req, res) => {
     const result = await resend.emails.send({
       from: EMAIL_FROM,
       to: [String(to).trim()],
-      subject: `Комерцијална Понуда ${String(offerNumber || '').replace(/[\r\n]/g, '')} - ИМФЕКС ЕКСПОРТ-ИМПОРТ`,
+      subject: `Комерцијална Понуда ${String(offerNumber || '').replace(/[\r\n]/g, '')} - ${companyName.replace(/[\r\n]/g, '')}`,
       html: htmlContent,
       attachments,
     });

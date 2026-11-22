@@ -221,6 +221,11 @@ model OfferItem {
   quantity                Int                      @default(1)
   unitPrice               Decimal                  @default(0.00) @map("unit_price") @db.Decimal(12, 2)
   totalPrice              Decimal                  @default(0.00) @map("total_price") @db.Decimal(12, 2)
+  selectedAccessories     Json?                    @map("selected_accessories")
+  serviceEquipmentTitle   String?                  @map("service_equipment_title")
+  serviceDefectDescription String?                 @map("service_defect_description")
+  serviceLaborHours       Decimal?                 @map("service_labor_hours") @db.Decimal(8, 2)
+  serviceConsumedPartId   String?                  @map("service_consumed_part_id")
   createdAt               DateTime                 @default(now()) @map("created_at")
   offerItemSpecifications OfferItemSpecification[]
 
@@ -522,9 +527,13 @@ model CompanySettings {
   taxId                 String   @default("MK4030012345678") @map("tax_id")
   phone                 String   @default("+389 2 3123 456")
   email                 String   @default("info@imfex.com")
-  bankAccount           String?  @map("bank_account")
-  defaultAdvancePercent Int      @default(50) @map("default_advance_percent")
-  updatedAt             DateTime @updatedAt @map("updated_at")
+  bankAccount            String?  @map("bank_account")
+  defaultAdvancePercent  Int      @default(50) @map("default_advance_percent")
+  oversizeAreaThreshold  Decimal  @default(8.00) @map("oversize_area_threshold") @db.Decimal(8, 2)
+  oversizeRatePerSqm     Decimal  @default(45.00) @map("oversize_rate_per_sqm") @db.Decimal(10, 2)
+  defaultHourlyLaborRate Decimal  @default(25.00) @map("default_hourly_labor_rate") @db.Decimal(10, 2)
+  minMarginPercent       Decimal  @default(15.00) @map("min_margin_percent") @db.Decimal(5, 2)
+  updatedAt              DateTime @updatedAt @map("updated_at")
 
   @@map("company_settings")
 }

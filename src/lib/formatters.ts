@@ -44,6 +44,23 @@ export const formatOfferForResponse = (offer: any) => {
         quantity: Number(item.quantity ?? 1),
         unitPrice: Number(item.unitPrice ?? 0),
         totalPrice: Number(item.totalPrice ?? 0),
+        selectedAccessories:
+          item.selectedAccessories && typeof item.selectedAccessories === 'object'
+            ? item.selectedAccessories
+            : undefined,
+        serviceEquipmentTitle: item.serviceEquipmentTitle || undefined,
+        serviceDefectDescription: item.serviceDefectDescription || undefined,
+        defectDescription: item.serviceDefectDescription || undefined,
+        serviceLaborHours:
+          item.serviceLaborHours !== undefined && item.serviceLaborHours !== null
+            ? Number(item.serviceLaborHours)
+            : undefined,
+        laborHours:
+          item.serviceLaborHours !== undefined && item.serviceLaborHours !== null
+            ? Number(item.serviceLaborHours)
+            : undefined,
+        serviceConsumedPartId: item.serviceConsumedPartId || undefined,
+        consumedPartProductId: item.serviceConsumedPartId || undefined,
         specifications: rawSpecs.map((s: any) => ({
           specificationKeyId: s.specificationKeyId || `custom-${s.id}`,
           specificationOptionId: s.specificationOptionId || undefined,

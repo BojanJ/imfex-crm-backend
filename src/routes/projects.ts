@@ -191,6 +191,31 @@ projectsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
           }
         : undefined;
 
+      // BIZ-05: Release un-dispatched reserved warehouse accessories if project is transitioning into CLOSED
+      let finalWorkflowData = mergedWorkflowData;
+      const prevStatus = existingProj?.status;
+      if (hasExplicitStatus && statusCheck.value === 'CLOSED' && prevStatus !== 'CLOSED') {
+        const prevWf =
+          existingProj?.workflowData && typeof existingProj.workflowData === 'object'
+            ? (existingProj.workflowData as Record<string, any>)
+            : {};
+        const reservedIds: string[] = Array.isArray(prevWf.reservedAccessoryIds)
+          ? prevWf.reservedAccessoryIds.filter((rid: unknown): rid is string => typeof rid === 'string' && isUuid(rid))
+          : [];
+        if (reservedIds.length > 0 && !prevWf.dispatchIssued && !finalWorkflowData?.dispatchIssued) {
+          for (const pid of reservedIds) {
+            const prod = await tx.product.findUnique({ where: { id: pid }, select: { id: true, reservedQuantity: true } });
+            if (prod && prod.reservedQuantity > 0) {
+              await tx.product.update({
+                where: { id: prod.id },
+                data: { reservedQuantity: Math.max(0, prod.reservedQuantity - 1) },
+              });
+            }
+          }
+          finalWorkflowData = { ...(finalWorkflowData ?? prevWf), reservedAccessoryIds: [] };
+        }
+      }
+
       const project = await tx.project.upsert({
         where: { projectNumber: cleanProjectNumber },
         update: {
@@ -208,7 +233,7 @@ projectsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
           ...(installationContact !== undefined ? { installationContact } : {}),
           ...(installationMinutes !== undefined ? { installationMinutes } : {}),
           ...(signatureUrl !== undefined ? { signatureUrl } : {}),
-          ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
+          ...(finalWorkflowData !== undefined ? { workflowData: finalWorkflowData } : {}),
         },
         create: {
           projectNumber: cleanProjectNumber,
@@ -227,7 +252,7 @@ projectsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
           installationContact,
           installationMinutes,
           signatureUrl,
-          ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
+          ...(finalWorkflowData !== undefined ? { workflowData: finalWorkflowData } : {}),
         },
         include: { customer: true, offer: true, responsibleUser: { select: SAFE_PROFILE_SELECT } },
       });
@@ -256,7 +281,28 @@ projectsRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), as
     if (!isUuid(id)) {
       return res.status(400).json({ error: 'Invalid project ID format.' });
     }
-    await prisma.project.delete({ where: { id } });
+    // BIZ-05: Release any un-dispatched reserved accessories before deleting project
+    await prisma.$transaction(async (tx) => {
+      const existing = await tx.project.findUnique({ where: { id }, select: { id: true, workflowData: true } });
+      if (existing?.workflowData && typeof existing.workflowData === 'object') {
+        const wf = existing.workflowData as Record<string, any>;
+        const reservedIds: string[] = Array.isArray(wf.reservedAccessoryIds)
+          ? wf.reservedAccessoryIds.filter((rid: unknown): rid is string => typeof rid === 'string' && isUuid(rid))
+          : [];
+        if (reservedIds.length > 0 && !wf.dispatchIssued) {
+          for (const pid of reservedIds) {
+            const prod = await tx.product.findUnique({ where: { id: pid }, select: { id: true, reservedQuantity: true } });
+            if (prod && prod.reservedQuantity > 0) {
+              await tx.product.update({
+                where: { id: prod.id },
+                data: { reservedQuantity: Math.max(0, prod.reservedQuantity - 1) },
+              });
+            }
+          }
+        }
+      }
+      await tx.project.delete({ where: { id } });
+    });
     void recordAudit(prisma, req as AuthenticatedRequest, { action: 'PROJECT_DELETED', entityType: 'Project', entityId: id });
     res.json({ success: true, id });
   } catch (error) {

@@ -7,6 +7,14 @@ import { recordAudit } from '../audit';
 
 export const settingsRouter = Router();
 
+const formatSettings = (s: any) => ({
+  ...s,
+  oversizeAreaThreshold: Number(s.oversizeAreaThreshold ?? 8),
+  oversizeRatePerSqm: Number(s.oversizeRatePerSqm ?? 45),
+  defaultHourlyLaborRate: Number(s.defaultHourlyLaborRate ?? 25),
+  minMarginPercent: Number(s.minMarginPercent ?? 15),
+});
+
 settingsRouter.get('/', async (_req, res) => {
   try {
     // Atomic upsert avoids duplicate-create race on fresh DB (API-17)
@@ -15,7 +23,7 @@ settingsRouter.get('/', async (_req, res) => {
       update: {},
       create: { id: 'default' },
     });
-    res.json(settings);
+    res.json(formatSettings(settings));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/company-settings');
   }
@@ -23,7 +31,19 @@ settingsRouter.get('/', async (_req, res) => {
 
 settingsRouter.put('/', requireRole('SUPER_ADMIN'), async (req, res) => {
   try {
-    const { companyName, address, taxId, phone, email, bankAccount, defaultAdvancePercent } = req.body ?? {};
+    const {
+      companyName,
+      address,
+      taxId,
+      phone,
+      email,
+      bankAccount,
+      defaultAdvancePercent,
+      oversizeAreaThreshold,
+      oversizeRatePerSqm,
+      defaultHourlyLaborRate,
+      minMarginPercent,
+    } = req.body ?? {};
 
     const companyNameCheck = parseOptionalString(companyName, 'companyName', 200);
     if (!companyNameCheck.ok) return res.status(400).json({ error: companyNameCheck.error });
@@ -52,6 +72,31 @@ settingsRouter.put('/', requireRole('SUPER_ADMIN'), async (req, res) => {
       advancePercentValue = advCheck.value;
     }
 
+    let oversizeThresholdVal: number | undefined;
+    if (oversizeAreaThreshold !== undefined && oversizeAreaThreshold !== null && oversizeAreaThreshold !== '') {
+      const check = parseFiniteNumber(oversizeAreaThreshold, 'oversizeAreaThreshold', { min: 0, max: 1000 });
+      if (!check.ok) return res.status(400).json({ error: check.error });
+      oversizeThresholdVal = check.value;
+    }
+    let oversizeRateVal: number | undefined;
+    if (oversizeRatePerSqm !== undefined && oversizeRatePerSqm !== null && oversizeRatePerSqm !== '') {
+      const check = parseFiniteNumber(oversizeRatePerSqm, 'oversizeRatePerSqm', { min: 0, max: 100000 });
+      if (!check.ok) return res.status(400).json({ error: check.error });
+      oversizeRateVal = check.value;
+    }
+    let hourlyLaborVal: number | undefined;
+    if (defaultHourlyLaborRate !== undefined && defaultHourlyLaborRate !== null && defaultHourlyLaborRate !== '') {
+      const check = parseFiniteNumber(defaultHourlyLaborRate, 'defaultHourlyLaborRate', { min: 0, max: 10000 });
+      if (!check.ok) return res.status(400).json({ error: check.error });
+      hourlyLaborVal = check.value;
+    }
+    let minMarginVal: number | undefined;
+    if (minMarginPercent !== undefined && minMarginPercent !== null && minMarginPercent !== '') {
+      const check = parseFiniteNumber(minMarginPercent, 'minMarginPercent', { min: 0, max: 100 });
+      if (!check.ok) return res.status(400).json({ error: check.error });
+      minMarginVal = check.value;
+    }
+
     const updateData = {
       ...(companyNameCheck.value ? { companyName: companyNameCheck.value.trim() } : {}),
       ...(addressCheck.value !== undefined && addressCheck.value !== null ? { address: addressCheck.value.trim() } : {}),
@@ -62,6 +107,10 @@ settingsRouter.put('/', requireRole('SUPER_ADMIN'), async (req, res) => {
         ? { bankAccount: bankAccountCheck.value ? bankAccountCheck.value.trim() : null }
         : {}),
       ...(advancePercentValue !== undefined ? { defaultAdvancePercent: advancePercentValue } : {}),
+      ...(oversizeThresholdVal !== undefined ? { oversizeAreaThreshold: oversizeThresholdVal } : {}),
+      ...(oversizeRateVal !== undefined ? { oversizeRatePerSqm: oversizeRateVal } : {}),
+      ...(hourlyLaborVal !== undefined ? { defaultHourlyLaborRate: hourlyLaborVal } : {}),
+      ...(minMarginVal !== undefined ? { minMarginPercent: minMarginVal } : {}),
     };
     const settings = await prisma.companySettings.upsert({
       where: { id: 'default' },
@@ -73,7 +122,7 @@ settingsRouter.put('/', requireRole('SUPER_ADMIN'), async (req, res) => {
       entityType: 'CompanySettings',
       entityId: 'default',
     });
-    res.json(settings);
+    res.json(formatSettings(settings));
   } catch (error) {
     return handleRouteError(res, error, 'PUT /api/company-settings');
   }

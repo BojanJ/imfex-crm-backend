@@ -550,13 +550,40 @@ financeRouter.post('/dispatch-notes', requireRole(...ROLE_GROUPS.FINANCE_SALES_W
 financeRouter.delete('/dispatch-notes/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
-    await prisma.dispatchNote.delete({ where: { id } });
+    // BIZ-05: Atomically restore warehouse stock if an issued dispatch note had deducted stock
+    const deleted = await prisma.$transaction(async (tx) => {
+      const existing = await tx.dispatchNote.findUnique({ where: { id } });
+      if (!existing) return null;
+      if (existing.stockDeducted && Array.isArray(existing.items)) {
+        for (const item of existing.items as any[]) {
+          if (isUuid(item?.productId)) {
+            const qty = Math.max(0, Math.round(Number(item?.quantity || 0)));
+            if (qty > 0) {
+              const prod = await tx.product.findUnique({
+                where: { id: item.productId },
+                select: { id: true, stockQuantity: true },
+              });
+              if (prod) {
+                await tx.product.update({
+                  where: { id: prod.id },
+                  data: { stockQuantity: prod.stockQuantity + qty },
+                });
+              }
+            }
+          }
+        }
+      }
+      await tx.dispatchNote.delete({ where: { id } });
+      return existing;
+    });
+    if (!deleted) return res.status(404).json({ error: 'Dispatch note not found.' });
     void recordAudit(prisma, req as AuthenticatedRequest, {
       action: 'DISPATCH_NOTE_DELETED',
       entityType: 'DispatchNote',
       entityId: id,
+      metadata: { stockRestored: deleted.stockDeducted },
     });
-    res.json({ success: true, id });
+    res.json({ success: true, id, stockRestored: deleted.stockDeducted });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/dispatch-notes/:id');
   }
@@ -763,14 +790,19 @@ financeRouter.post('/inventory-movements', requireRole(...ROLE_GROUPS.FINANCE_SA
     };
 
     const saved = await prisma.$transaction(async (tx) => {
+      const existing = await tx.inventoryMovement.findUnique({
+        where: { id: String(b.id) },
+        select: { id: true },
+      });
+
       const upserted = await tx.inventoryMovement.upsert({
         where: { id: String(b.id) },
         update: data,
         create: { id: String(b.id), ...data },
       });
 
-      // Optional atomic stock adjustment when client explicitly requests server-side stock delta (API-10)
-      if (b.applyStockDelta && isUuid(data.productId) && parsedQty && parsedQty > 0) {
+      // Atomic stock adjustment on first insert only (prevents double-application on retry) (API-10, BIZ-05)
+      if (!existing && b.applyStockDelta && isUuid(data.productId) && parsedQty !== null && parsedQty !== 0) {
         const prod = await tx.product.findUnique({
           where: { id: data.productId },
           select: { id: true, stockQuantity: true },
@@ -778,15 +810,21 @@ financeRouter.post('/inventory-movements', requireRole(...ROLE_GROUPS.FINANCE_SA
         if (prod) {
           const isIncoming = data.kind === 'ПРИЕМ' || data.kind === 'IN';
           const isOutgoing = data.kind === 'ИЗЛЕЗ' || data.kind === 'OUT';
-          if (isIncoming) {
+          const isCorrection = data.kind === 'КОРЕКЦИЈА';
+          if (isIncoming && parsedQty > 0) {
             await tx.product.update({
               where: { id: prod.id },
               data: { stockQuantity: prod.stockQuantity + parsedQty },
             });
-          } else if (isOutgoing) {
+          } else if (isOutgoing && parsedQty > 0) {
             await tx.product.update({
               where: { id: prod.id },
               data: { stockQuantity: Math.max(0, prod.stockQuantity - parsedQty) },
+            });
+          } else if (isCorrection) {
+            await tx.product.update({
+              where: { id: prod.id },
+              data: { stockQuantity: Math.max(0, prod.stockQuantity + parsedQty) },
             });
           }
         }

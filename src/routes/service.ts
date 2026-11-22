@@ -133,38 +133,98 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
       validTech = techExists.id;
     }
 
-    // API-14: Preserve omitted fields during partial updates & persist installedItemId changes
-    const ticket = await prisma.serviceTicket.upsert({
-      where: { ticketNumber: cleanTicketNumber },
-      update: {
-        ...(hasPriority ? { priority: priorityCheck.value } : {}),
-        ...(hasStatus ? { status: statusCheck.value } : {}),
-        ...(defectDescription !== undefined && String(defectDescription).trim() !== ''
-          ? { defectDescription: String(defectDescription) }
-          : {}),
-        ...(hasLabor ? { laborHours: laborCheck.value } : {}),
-        ...(solution !== undefined ? { solution } : {}),
-        ...(installedItemId !== undefined ? { installedItemId: validItem } : {}),
-        ...(assignedTechnicianId !== undefined ? { assignedTechnicianId: validTech } : {}),
-        ...(scheduledDate !== undefined ? { scheduledDate: scheduledCheck.value } : {}),
-        ...(partsConsumed !== undefined ? { partsConsumed } : {}),
-        ...(closedAt !== undefined ? { closedAt: closedAtCheck.value } : {}),
-      },
-      create: {
-        ticketNumber: cleanTicketNumber,
-        customerId,
-        installedItemId: validItem,
-        defectDescription: defectDescription || 'Пријавен дефект',
-        priority: priorityCheck.value,
-        status: statusCheck.value,
-        laborHours: laborCheck.value,
-        solution,
-        assignedTechnicianId: validTech,
-        scheduledDate: scheduledCheck.value ?? undefined,
-        partsConsumed,
-        closedAt: closedAtCheck.value ?? undefined,
-      },
-      include: { customer: true, installedItem: true, assignedTechnician: { select: SAFE_PROFILE_SELECT } },
+    // API-14 + BIZ-05: Preserve omitted fields during partial updates & atomically reconcile spare-part warehouse stock
+    const ticket = await prisma.$transaction(async (tx) => {
+      const existingTicket = await tx.serviceTicket.findUnique({
+        where: { ticketNumber: cleanTicketNumber },
+        select: { id: true, partsConsumed: true },
+      });
+
+      const saved = await tx.serviceTicket.upsert({
+        where: { ticketNumber: cleanTicketNumber },
+        update: {
+          ...(hasPriority ? { priority: priorityCheck.value } : {}),
+          ...(hasStatus ? { status: statusCheck.value } : {}),
+          ...(defectDescription !== undefined && String(defectDescription).trim() !== ''
+            ? { defectDescription: String(defectDescription) }
+            : {}),
+          ...(hasLabor ? { laborHours: laborCheck.value } : {}),
+          ...(solution !== undefined ? { solution } : {}),
+          ...(installedItemId !== undefined ? { installedItemId: validItem } : {}),
+          ...(assignedTechnicianId !== undefined ? { assignedTechnicianId: validTech } : {}),
+          ...(scheduledDate !== undefined ? { scheduledDate: scheduledCheck.value } : {}),
+          ...(partsConsumed !== undefined ? { partsConsumed } : {}),
+          ...(closedAt !== undefined ? { closedAt: closedAtCheck.value } : {}),
+        },
+        create: {
+          ticketNumber: cleanTicketNumber,
+          customerId,
+          installedItemId: validItem,
+          defectDescription: defectDescription || 'Пријавен дефект',
+          priority: priorityCheck.value,
+          status: statusCheck.value,
+          laborHours: laborCheck.value,
+          solution,
+          assignedTechnicianId: validTech,
+          scheduledDate: scheduledCheck.value ?? undefined,
+          partsConsumed,
+          closedAt: closedAtCheck.value ?? undefined,
+        },
+        include: { customer: true, installedItem: true, assignedTechnician: { select: SAFE_PROFILE_SELECT } },
+      });
+
+      if (partsConsumed !== undefined && Array.isArray(partsConsumed)) {
+        const sumByProduct = (parts: unknown): Map<string, { qty: number; name: string }> => {
+          const map = new Map<string, { qty: number; name: string }>();
+          if (!Array.isArray(parts)) return map;
+          for (const p of parts as any[]) {
+            if (p && typeof p === 'object' && isUuid(p.productId)) {
+              const qty = Math.max(0, Math.round(Number(p.quantity || 0)));
+              if (qty > 0) {
+                const prev = map.get(p.productId);
+                map.set(p.productId, { qty: (prev?.qty || 0) + qty, name: String(p.partName || prev?.name || 'Дел') });
+              }
+            }
+          }
+          return map;
+        };
+
+        const prevMap = sumByProduct(existingTicket?.partsConsumed);
+        const nextMap = sumByProduct(partsConsumed);
+        const allProductIds = new Set([...prevMap.keys(), ...nextMap.keys()]);
+
+        for (const pid of allProductIds) {
+          const prevQty = prevMap.get(pid)?.qty || 0;
+          const nextQty = nextMap.get(pid)?.qty || 0;
+          const delta = nextQty - prevQty; // positive = newly consumed (deduct stock), negative = removed (restore stock)
+          if (delta === 0) continue;
+
+          const prod = await tx.product.findUnique({ where: { id: pid }, select: { id: true, name: true, stockQuantity: true } });
+          if (!prod) continue;
+
+          await tx.product.update({
+            where: { id: prod.id },
+            data: { stockQuantity: Math.max(0, prod.stockQuantity - delta) },
+          });
+
+          const moveId = `srv-mv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+          await tx.inventoryMovement.create({
+            data: {
+              id: moveId,
+              kind: delta > 0 ? 'ИЗЛЕЗ' : 'ПРИЕМ',
+              detail:
+                delta > 0
+                  ? `Сервис ${saved.ticketNumber}: вграден дел „${prod.name}“ (${delta} ком.)`
+                  : `Сервис ${saved.ticketNumber}: вратен дел „${prod.name}“ (${Math.abs(delta)} ком.)`,
+              productId: prod.id,
+              quantity: Math.abs(delta),
+              at: new Date().toISOString(),
+            },
+          });
+        }
+      }
+
+      return saved;
     });
     void recordAudit(prisma, req as AuthenticatedRequest, {
       action: 'SERVICE_TICKET_SAVED',

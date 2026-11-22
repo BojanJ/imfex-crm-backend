@@ -134,6 +134,11 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
       quantity: number;
       unitPrice: number;
       totalPrice: number;
+      selectedAccessories: Record<string, string> | null;
+      serviceEquipmentTitle: string | null;
+      serviceDefectDescription: string | null;
+      serviceLaborHours: number | null;
+      serviceConsumedPartId: string | null;
       rawSpecs: any[];
     }> = [];
 
@@ -180,6 +185,26 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
           ? item.offerItemSpecifications
           : [];
 
+        let selectedAcc: Record<string, string> | null = null;
+        if (item?.selectedAccessories && typeof item.selectedAccessories === 'object' && !Array.isArray(item.selectedAccessories)) {
+          const accObj: Record<string, string> = {};
+          for (const [k, v] of Object.entries(item.selectedAccessories)) {
+            if (typeof v === 'string' && v.trim()) {
+              accObj[String(k).slice(0, 64)] = v.trim().slice(0, 128);
+            }
+          }
+          if (Object.keys(accObj).length > 0) selectedAcc = accObj;
+        }
+        let serviceLaborHoursVal: number | null = null;
+        const rawLaborHours = item?.serviceLaborHours ?? item?.laborHours;
+        if (rawLaborHours !== undefined && rawLaborHours !== null && rawLaborHours !== '') {
+          const slhCheck = parseFiniteNumber(rawLaborHours, `items[${i}].serviceLaborHours`, { min: 0, max: 10000 });
+          if (!slhCheck.ok) return res.status(400).json({ error: slhCheck.error });
+          serviceLaborHoursVal = slhCheck.value;
+        }
+        const rawDefect = item?.serviceDefectDescription ?? item?.defectDescription;
+        const rawPartId = item?.serviceConsumedPartId ?? item?.consumedPartProductId;
+
         validatedItems.push({
           productId: isUuid(item?.productId) ? item.productId : null,
           productModelId: isUuid(item?.productModelId) ? item.productModelId : null,
@@ -192,6 +217,17 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
           quantity: qtyCheck.value,
           unitPrice: unitPriceCheck.value,
           totalPrice: computedLineTotal,
+          selectedAccessories: selectedAcc,
+          serviceEquipmentTitle:
+            typeof item?.serviceEquipmentTitle === 'string' && item.serviceEquipmentTitle.trim()
+              ? item.serviceEquipmentTitle.trim().slice(0, 500)
+              : null,
+          serviceDefectDescription:
+            typeof rawDefect === 'string' && rawDefect.trim()
+              ? rawDefect.trim().slice(0, 2000)
+              : null,
+          serviceLaborHours: serviceLaborHoursVal,
+          serviceConsumedPartId: isUuid(rawPartId) ? rawPartId : null,
           rawSpecs,
         });
       }
@@ -346,6 +382,11 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
                 quantity: item.quantity,
                 unitPrice: item.unitPrice,
                 totalPrice: item.totalPrice,
+                selectedAccessories: item.selectedAccessories ?? undefined,
+                serviceEquipmentTitle: item.serviceEquipmentTitle,
+                serviceDefectDescription: item.serviceDefectDescription,
+                serviceLaborHours: item.serviceLaborHours,
+                serviceConsumedPartId: item.serviceConsumedPartId,
               },
             });
 

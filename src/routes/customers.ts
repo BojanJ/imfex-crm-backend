@@ -7,6 +7,7 @@ import {
   isUuid,
   CUSTOMER_TYPES,
   parseEnum,
+  parseFiniteNumber,
   parsePagination,
   buildPrismaPaginationArgs,
   handleRouteError,
@@ -78,7 +79,20 @@ customersRouter.get('/:id', async (req, res) => {
 
 customersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, res) => {
   try {
-    const { id, name, companyName, taxId, customerType, email, phone, address, city, notes } = req.body ?? {};
+    const {
+      id,
+      name,
+      companyName,
+      taxId,
+      customerType,
+      email,
+      phone,
+      address,
+      city,
+      notes,
+      creditLimit,
+      paymentTermsDays,
+    } = req.body ?? {};
     const cleanName = typeof name === 'string' ? name.trim() : '';
     if (!cleanName) {
       return res.status(400).json({ error: 'Customer name is required.' });
@@ -90,6 +104,24 @@ customersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (re
       return res.status(400).json({ error: 'Invalid customer email address.' });
     }
 
+    let creditLimitVal: number | null | undefined;
+    if (creditLimit !== undefined) {
+      if (creditLimit === null || creditLimit === '') {
+        creditLimitVal = null;
+      } else {
+        const clCheck = parseFiniteNumber(creditLimit, 'creditLimit', { min: 0 });
+        if (!clCheck.ok) return res.status(400).json({ error: clCheck.error });
+        creditLimitVal = clCheck.value;
+      }
+    }
+    const termsCheck = parseFiniteNumber(paymentTermsDays, 'paymentTermsDays', {
+      min: 0,
+      max: 365,
+      defaultVal: 15,
+      integer: true,
+    });
+    if (!termsCheck.ok) return res.status(400).json({ error: termsCheck.error });
+
     const data = {
       name: cleanName,
       companyName: companyName ?? null,
@@ -100,6 +132,8 @@ customersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (re
       address: address ?? null,
       city: city ?? null,
       notes: notes ?? null,
+      ...(creditLimitVal !== undefined ? { creditLimit: creditLimitVal } : {}),
+      ...(paymentTermsDays !== undefined ? { paymentTermsDays: termsCheck.value } : {}),
     };
 
     const customer = isUuid(id)

@@ -86,6 +86,13 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
       taxAmount,
       totalAmount,
       validUntil,
+      version,
+      parentOfferId,
+      lostReason,
+      followUpDate,
+      paymentTerms,
+      deliveryTerms,
+      warrantyTerms,
       items,
     } = req.body ?? {};
 
@@ -103,6 +110,10 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
 
     const validUntilCheck = parseOptionalDate(validUntil, 'validUntil');
     if (!validUntilCheck.ok) return res.status(400).json({ error: validUntilCheck.error });
+    const followUpCheck = parseOptionalDate(followUpDate, 'followUpDate');
+    if (!followUpCheck.ok) return res.status(400).json({ error: followUpCheck.error });
+    const versionCheck = parseFiniteNumber(version, 'version', { min: 1, max: 1000, defaultVal: 1, integer: true });
+    if (!versionCheck.ok) return res.status(400).json({ error: versionCheck.error });
 
     // API-03: Preserve 0% taxRate explicitly (only default to 18 when omitted/null/empty)
     const taxRateCheck = parseFiniteNumber(taxRate, 'taxRate', { min: 0, max: 100, defaultVal: 18 });
@@ -303,6 +314,19 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
               taxAmount: nextTax,
               totalAmount: nextTotal,
               ...(validUntil !== undefined ? { validUntil: validUntilCheck.value ?? null } : {}),
+              ...(lostReason !== undefined
+                ? { lostReason: typeof lostReason === 'string' && lostReason.trim() ? lostReason.trim().slice(0, 500) : null }
+                : {}),
+              ...(followUpDate !== undefined ? { followUpDate: followUpCheck.value ?? null } : {}),
+              ...(paymentTerms !== undefined
+                ? { paymentTerms: typeof paymentTerms === 'string' && paymentTerms.trim() ? paymentTerms.trim().slice(0, 500) : null }
+                : {}),
+              ...(deliveryTerms !== undefined
+                ? { deliveryTerms: typeof deliveryTerms === 'string' && deliveryTerms.trim() ? deliveryTerms.trim().slice(0, 500) : null }
+                : {}),
+              ...(warrantyTerms !== undefined
+                ? { warrantyTerms: typeof warrantyTerms === 'string' && warrantyTerms.trim() ? warrantyTerms.trim().slice(0, 500) : null }
+                : {}),
             },
           });
         } else {
@@ -342,6 +366,13 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
               taxAmount: computedTaxAmount,
               totalAmount: computedTotalAmount,
               validUntil: validUntilCheck.value ?? null,
+              version: versionCheck.value,
+              parentOfferId: isUuid(parentOfferId) ? parentOfferId : null,
+              lostReason: typeof lostReason === 'string' && lostReason.trim() ? lostReason.trim().slice(0, 500) : null,
+              followUpDate: followUpCheck.value ?? null,
+              paymentTerms: typeof paymentTerms === 'string' && paymentTerms.trim() ? paymentTerms.trim().slice(0, 500) : null,
+              deliveryTerms: typeof deliveryTerms === 'string' && deliveryTerms.trim() ? deliveryTerms.trim().slice(0, 500) : null,
+              warrantyTerms: typeof warrantyTerms === 'string' && warrantyTerms.trim() ? warrantyTerms.trim().slice(0, 500) : null,
             },
           });
         }
@@ -456,6 +487,111 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
     res.json(formatOfferForResponse(fullOffer));
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/offers');
+  }
+});
+
+// BIZ-04: Clone an existing offer into a new DRAFT revision (v+1) with all items & specifications
+offersRouter.post('/:id/clone', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid offer ID format.' });
+    }
+    const source = await prisma.offer.findUnique({
+      where: { id },
+      include: {
+        items: {
+          include: { offerItemSpecifications: true },
+        },
+      },
+    });
+    if (!source) return res.status(404).json({ error: 'Offer not found.' });
+
+    const cloned = await prisma.$transaction(async (tx) => {
+      const year = new Date().getFullYear();
+      const count = await tx.offer.count();
+      let seq = count + 1;
+      let nextOfferNumber = `OFF-${year}-${String(seq).padStart(4, '0')}`;
+      while (await tx.offer.findUnique({ where: { offerNumber: nextOfferNumber }, select: { id: true } })) {
+        seq += 1;
+        nextOfferNumber = `OFF-${year}-${String(seq).padStart(4, '0')}`;
+      }
+
+      const validUntil = new Date(Date.now() + 30 * 86_400_000);
+      const created = await tx.offer.create({
+        data: {
+          offerNumber: nextOfferNumber,
+          customerId: source.customerId,
+          createdByUserId: req.user?.id ?? source.createdByUserId,
+          status: 'DRAFT',
+          version: (source.version ?? 1) + 1,
+          parentOfferId: source.id,
+          taxRate: source.taxRate,
+          discountRate: source.discountRate,
+          discountAmount: source.discountAmount,
+          subtotal: source.subtotal,
+          taxAmount: source.taxAmount,
+          totalAmount: source.totalAmount,
+          validUntil,
+          paymentTerms: source.paymentTerms,
+          deliveryTerms: source.deliveryTerms,
+          warrantyTerms: source.warrantyTerms,
+        },
+      });
+
+      for (const item of source.items) {
+        const createdItem = await tx.offerItem.create({
+          data: {
+            offerId: created.id,
+            serviceTypes: item.serviceTypes,
+            productId: item.productId,
+            productModelId: item.productModelId,
+            customTitle: item.customTitle,
+            widthMm: item.widthMm,
+            heightMm: item.heightMm,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+            totalPrice: item.totalPrice,
+            selectedAccessories: item.selectedAccessories ?? undefined,
+            serviceEquipmentTitle: item.serviceEquipmentTitle,
+            serviceDefectDescription: item.serviceDefectDescription,
+            serviceLaborHours: item.serviceLaborHours,
+            serviceConsumedPartId: item.serviceConsumedPartId,
+          },
+        });
+        if (item.offerItemSpecifications.length > 0) {
+          await tx.offerItemSpecification.createMany({
+            data: item.offerItemSpecifications.map((s) => ({
+              offerItemId: createdItem.id,
+              specificationKeyId: s.specificationKeyId,
+              specificationOptionId: s.specificationOptionId,
+              customValue: s.customValue,
+              customKeyName: s.customKeyName,
+              customPriceModifier: s.customPriceModifier,
+            })),
+          });
+        }
+      }
+
+      return tx.offer.findUnique({
+        where: { id: created.id },
+        include: {
+          customer: true,
+          createdByUser: { select: SAFE_PROFILE_SELECT },
+          items: { include: { offerItemSpecifications: true } },
+        },
+      });
+    });
+
+    void recordAudit(prisma, req, {
+      action: 'OFFER_CLONED',
+      entityType: 'Offer',
+      entityId: cloned?.id,
+      metadata: { sourceOfferId: source.id, newOfferNumber: cloned?.offerNumber, version: cloned?.version },
+    });
+    res.status(201).json(formatOfferForResponse(cloned));
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/offers/:id/clone');
   }
 });
 

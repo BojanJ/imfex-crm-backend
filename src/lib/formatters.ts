@@ -29,6 +29,13 @@ export const formatOfferForResponse = (offer: any) => {
   if (!offer) return offer;
   const formatted: Record<string, any> = {
     ...offer,
+    version: Number(offer.version ?? 1),
+    parentOfferId: offer.parentOfferId || undefined,
+    lostReason: offer.lostReason || undefined,
+    followUpDate: offer.followUpDate || undefined,
+    paymentTerms: offer.paymentTerms || undefined,
+    deliveryTerms: offer.deliveryTerms || undefined,
+    warrantyTerms: offer.warrantyTerms || undefined,
     taxRate: Number(offer.taxRate ?? 0),
     discountRate: Number(offer.discountRate ?? 0),
     discountAmount: Number(offer.discountAmount ?? 0),

@@ -195,6 +195,11 @@ describe('Modular Express App & Routing (IMP-01)', () => {
       body: JSON.stringify({ to: 'client@example.com', invoiceNumber: 'FAK-2026-0001' }),
     });
     expect(reminderRes.status).toBe(401);
+
+    const cloneRes = await fetch(`${baseUrl}/api/offers/${sampleId}/clone`, {
+      method: 'POST',
+    });
+    expect(cloneRes.status).toBe(401);
   });
 
   it('flattens project workflowData and strips document base64 payloads by default (IMP-11)', () => {

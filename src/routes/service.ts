@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { formatProductForResponse, formatTicketForResponse } from '../lib/formatters';
-import { SAFE_PROFILE_SELECT, ROLE_GROUPS, requireRole } from '../auth';
+import { SAFE_PROFILE_SELECT, AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import {
   isUuid,
   SERVICE_PRIORITIES,
@@ -13,6 +13,7 @@ import {
   buildPrismaPaginationArgs,
   handleRouteError,
 } from '../validation';
+import { recordAudit } from '../audit';
 
 export const serviceRouter = Router();
 
@@ -22,17 +23,20 @@ serviceRouter.get('/service-tickets', async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const tickets = await prisma.serviceTicket.findMany({
-      include: {
-        customer: true,
-        installedItem: true,
-        assignedTechnician: { select: SAFE_PROFILE_SELECT },
-      },
-      orderBy: { createdAt: 'desc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+    const [tickets, totalCount] = await Promise.all([
+      prisma.serviceTicket.findMany({
+        include: {
+          customer: true,
+          installedItem: true,
+          assignedTechnician: { select: SAFE_PROFILE_SELECT },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.serviceTicket.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.serviceTicket.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(tickets.map(formatTicketForResponse));
   } catch (error) {
@@ -91,12 +95,15 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
       return res.status(404).json({ error: 'Referenced customer not found.' });
     }
 
+    const hasPriority = priority !== undefined && priority !== null && priority !== '';
     const priorityCheck = parseEnum(priority, SERVICE_PRIORITIES, 'priority', 'MEDIUM');
     if (!priorityCheck.ok) return res.status(400).json({ error: priorityCheck.error });
 
+    const hasStatus = status !== undefined && status !== null && status !== '';
     const statusCheck = parseEnum(status, SERVICE_STATUSES, 'status', 'OPEN');
     if (!statusCheck.ok) return res.status(400).json({ error: statusCheck.error });
 
+    const hasLabor = laborHours !== undefined && laborHours !== null && laborHours !== '';
     const laborCheck = parseFiniteNumber(laborHours, 'laborHours', { min: 0, defaultVal: 0 });
     if (!laborCheck.ok) return res.status(400).json({ error: laborCheck.error });
 
@@ -126,18 +133,22 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
       validTech = techExists.id;
     }
 
+    // API-14: Preserve omitted fields during partial updates & persist installedItemId changes
     const ticket = await prisma.serviceTicket.upsert({
       where: { ticketNumber: cleanTicketNumber },
       update: {
-        priority: priorityCheck.value,
-        status: statusCheck.value,
-        defectDescription: defectDescription || 'Пријавен дефект',
-        laborHours: laborCheck.value,
-        solution,
-        assignedTechnicianId: assignedTechnicianId !== undefined ? validTech : undefined,
-        scheduledDate: scheduledCheck.value,
-        partsConsumed,
-        closedAt: closedAtCheck.value,
+        ...(hasPriority ? { priority: priorityCheck.value } : {}),
+        ...(hasStatus ? { status: statusCheck.value } : {}),
+        ...(defectDescription !== undefined && String(defectDescription).trim() !== ''
+          ? { defectDescription: String(defectDescription) }
+          : {}),
+        ...(hasLabor ? { laborHours: laborCheck.value } : {}),
+        ...(solution !== undefined ? { solution } : {}),
+        ...(installedItemId !== undefined ? { installedItemId: validItem } : {}),
+        ...(assignedTechnicianId !== undefined ? { assignedTechnicianId: validTech } : {}),
+        ...(scheduledDate !== undefined ? { scheduledDate: scheduledCheck.value } : {}),
+        ...(partsConsumed !== undefined ? { partsConsumed } : {}),
+        ...(closedAt !== undefined ? { closedAt: closedAtCheck.value } : {}),
       },
       create: {
         ticketNumber: cleanTicketNumber,
@@ -155,6 +166,12 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
       },
       include: { customer: true, installedItem: true, assignedTechnician: { select: SAFE_PROFILE_SELECT } },
     });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'SERVICE_TICKET_SAVED',
+      entityType: 'ServiceTicket',
+      entityId: ticket.id,
+      metadata: { ticketNumber: ticket.ticketNumber, status: ticket.status, priority: ticket.priority },
+    });
     res.json(formatTicketForResponse(ticket));
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/service-tickets');
@@ -168,6 +185,11 @@ serviceRouter.delete('/service-tickets/:id', requireRole(...ROLE_GROUPS.DESTRUCT
       return res.status(400).json({ error: 'Invalid service ticket ID format.' });
     }
     await prisma.serviceTicket.delete({ where: { id } });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'SERVICE_TICKET_DELETED',
+      entityType: 'ServiceTicket',
+      entityId: id,
+    });
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/service-tickets/:id');
@@ -180,13 +202,16 @@ serviceRouter.get('/installed-items', async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const items = await prisma.installedItem.findMany({
-      include: { customer: true, project: true, product: true },
-      orderBy: { installationDate: 'desc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+    const [items, totalCount] = await Promise.all([
+      prisma.installedItem.findMany({
+        include: { customer: true, project: true, product: true },
+        orderBy: [{ installationDate: 'desc' }, { id: 'desc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.installedItem.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.installedItem.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(
       items.map((it) => ({
@@ -238,6 +263,9 @@ serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
       ? await prisma.installedItem.upsert({
           where: { id },
           update: {
+            customerId,
+            ...(projectId !== undefined ? { projectId: validProjectId } : {}),
+            ...(productId !== undefined ? { productId: validProductId } : {}),
             title: cleanTitle,
             serialNumber: serialNumber ?? null,
             installationDate: installDateCheck.value ?? undefined,
@@ -262,6 +290,12 @@ serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
             installationDate: installDateCheck.value ?? undefined,
           },
         });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'INSTALLED_ITEM_SAVED',
+      entityType: 'InstalledItem',
+      entityId: item.id,
+      metadata: { title: item.title, customerId: item.customerId },
+    });
     res.json(item);
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/installed-items');
@@ -275,6 +309,11 @@ serviceRouter.delete('/installed-items/:id', requireRole(...ROLE_GROUPS.DESTRUCT
       return res.status(400).json({ error: 'Invalid installed item ID format.' });
     }
     await prisma.installedItem.delete({ where: { id } });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'INSTALLED_ITEM_DELETED',
+      entityType: 'InstalledItem',
+      entityId: id,
+    });
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/installed-items/:id');

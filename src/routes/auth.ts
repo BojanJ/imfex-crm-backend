@@ -51,11 +51,28 @@ publicAuthRouter.post('/login', loginLimiter, async (req, res) => {
     if (!user || user.status === 'DISABLED' || !user.passwordHash) {
       // Constant-time mitigation against email/status enumeration (SEC-16)
       await bcrypt.compare(cleanPassword, DUMMY_PASSWORD_HASH);
+      void recordAudit(prisma, undefined, {
+        action: 'AUTH_LOGIN_FAILED',
+        entityType: 'Profile',
+        entityId: user?.id ?? null,
+        actorEmail: cleanEmail,
+        ipAddress: getClientIp(req as AuthenticatedRequest),
+        metadata: { reason: !user ? 'not_found' : user.status === 'DISABLED' ? 'disabled' : 'no_hash' },
+      });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const isValid = await bcrypt.compare(cleanPassword, user.passwordHash);
     if (!isValid) {
+      void recordAudit(prisma, undefined, {
+        action: 'AUTH_LOGIN_FAILED',
+        entityType: 'Profile',
+        entityId: user.id,
+        actorUserId: user.id,
+        actorEmail: user.email,
+        ipAddress: getClientIp(req as AuthenticatedRequest),
+        metadata: { reason: 'wrong_password' },
+      });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 

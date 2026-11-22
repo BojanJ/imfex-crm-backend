@@ -21,6 +21,37 @@ export const PROJECT_STATUSES = [
 ] as const;
 export const SERVICE_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] as const;
 export const SERVICE_STATUSES = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'COMPLETED', 'CLOSED'] as const;
+export const PURCHASE_INVOICE_STATUSES = ['DRAFT', 'INVOICED', 'PARTIAL_PAID', 'PAID', 'CANCELLED'] as const;
+export const RECEIPT_STATUSES = ['PENDING', 'PARTIAL', 'RECEIVED'] as const;
+export const SALES_INVOICE_TYPES = ['PROFORMA', 'ADVANCE', 'FINAL'] as const;
+export const SALES_INVOICE_STATUSES = ['DRAFT', 'ISSUED', 'PARTIAL_PAID', 'PAID', 'CANCELLED'] as const;
+export const DISPATCH_STATUSES = ['DRAFT', 'ISSUED', 'DELIVERED', 'CANCELLED'] as const;
+export const PAYMENT_DIRECTIONS = ['IN', 'OUT'] as const;
+export const PAYMENT_METHODS = ['BANK', 'CASH', 'CARD', 'COMPENSATION', 'OTHER'] as const;
+export const INVENTORY_MOVE_KINDS = [
+  'ПРИЕМ',
+  'ИЗЛЕЗ',
+  'РЕЗЕРВАЦИЈА',
+  'УПЛАТА',
+  'НАБАВКА',
+  'КОРЕКЦИЈА',
+  'IN',
+  'OUT',
+  'RESERVE',
+  'PAYMENT',
+  'PURCHASE',
+  'ADJUSTMENT',
+] as const;
+export const CALENDAR_EVENT_TYPES = [
+  'MEETING',
+  'INSTALLATION',
+  'SERVICE',
+  'PROJECT',
+  'MAINTENANCE',
+  'EVENT',
+  'DELIVERY',
+  'OTHER',
+] as const;
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -88,6 +119,19 @@ export function parseFiniteNumber(
     if (opts.defaultVal !== undefined) return { ok: true, value: opts.defaultVal };
     return { ok: false, error: `${fieldName} is required.` };
   }
+  // Reject booleans, arrays, objects, and whitespace-only strings (API-19)
+  if (typeof value === 'boolean') {
+    return { ok: false, error: `${fieldName} must be a valid finite number.` };
+  }
+  if (typeof value === 'string') {
+    if (value.trim() === '') {
+      if (opts.defaultVal !== undefined) return { ok: true, value: opts.defaultVal };
+      return { ok: false, error: `${fieldName} must be a valid finite number.` };
+    }
+  } else if (typeof value !== 'number') {
+    return { ok: false, error: `${fieldName} must be a valid finite number.` };
+  }
+
   const num = Number(value);
   if (!Number.isFinite(num)) {
     return { ok: false, error: `${fieldName} must be a valid finite number.` };
@@ -99,6 +143,22 @@ export function parseFiniteNumber(
     return { ok: false, error: `${fieldName} must be at most ${opts.max}.` };
   }
   return { ok: true, value: opts.integer ? Math.round(num) : num };
+}
+
+export function parseOptionalString(
+  value: unknown,
+  fieldName: string,
+  maxLength = 5000
+): ValidationResult<string | null | undefined> {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (value === null) return { ok: true, value: null };
+  if (typeof value !== 'string') {
+    return { ok: false, error: `${fieldName} must be a string.` };
+  }
+  if (value.length > maxLength) {
+    return { ok: false, error: `${fieldName} exceeds maximum length of ${maxLength} characters.` };
+  }
+  return { ok: true, value };
 }
 
 export interface PaginationParams {
@@ -158,12 +218,17 @@ export function parsePagination(
   };
 }
 
-export function buildPrismaPaginationArgs(p: PaginationParams): {
+export const DEFAULT_UNPAGINATED_LIMIT = 500;
+
+export function buildPrismaPaginationArgs(
+  p: PaginationParams,
+  defaultTake = DEFAULT_UNPAGINATED_LIMIT
+): {
   take?: number;
   skip?: number;
   cursor?: { id: string };
 } {
-  if (!p.isPaginated) return {};
+  if (!p.isPaginated) return { take: defaultTake };
   return {
     ...(p.take !== undefined ? { take: p.take } : {}),
     ...(p.skip !== undefined ? { skip: p.skip } : {}),

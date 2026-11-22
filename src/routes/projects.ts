@@ -3,6 +3,7 @@ import { prisma } from '../lib/prisma';
 import { extractWorkflowData, formatProjectForResponse } from '../lib/formatters';
 import { SAFE_PROFILE_SELECT, AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import { validateSignatureUrl } from '../security';
+import { DOCUMENT_LIST_SELECT } from '../storage';
 import {
   isUuid,
   PROJECT_STATUSES,
@@ -22,19 +23,22 @@ projectsRouter.get('/', async (req, res) => {
     if (!page.ok) return res.status(400).json({ error: page.error });
     const includeData = req.query.includeData === 'true';
 
-    const projects = await prisma.project.findMany({
-      include: {
-        customer: true,
-        offer: true,
-        responsibleUser: { select: SAFE_PROFILE_SELECT },
-        installedItems: true,
-        documents: true,
-      },
-      orderBy: { createdAt: 'desc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+    const [projects, totalCount] = await Promise.all([
+      prisma.project.findMany({
+        include: {
+          customer: true,
+          offer: true,
+          responsibleUser: { select: SAFE_PROFILE_SELECT },
+          installedItems: true,
+          documents: includeData ? true : { select: DOCUMENT_LIST_SELECT },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.project.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.project.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(projects.map((p) => formatProjectForResponse(p, includeData)));
   } catch (error) {
@@ -56,7 +60,7 @@ projectsRouter.get('/:id', async (req, res) => {
         offer: true,
         responsibleUser: { select: SAFE_PROFILE_SELECT },
         installedItems: true,
-        documents: true,
+        documents: includeData ? true : { select: DOCUMENT_LIST_SELECT },
       },
     });
     if (!project) return res.status(404).json({ error: 'Project not found.' });
@@ -92,7 +96,10 @@ projectsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
       return res.status(400).json({ error: 'projectNumber is required.' });
     }
 
-    const statusCheck = parseEnum(status, PROJECT_STATUSES, 'status', 'PLANNED');
+    const hasExplicitStatus = status !== undefined && status !== null && status !== '';
+    const statusCheck = hasExplicitStatus
+      ? parseEnum(status, PROJECT_STATUSES, 'status')
+      : ({ ok: true as const, value: 'PLANNED' as const });
     if (!statusCheck.ok) return res.status(400).json({ error: statusCheck.error });
 
     const startDateCheck = parseOptionalDate(startDate, 'startDate');
@@ -103,51 +110,6 @@ projectsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
     if (!actualDeliveryCheck.ok) return res.status(400).json({ error: actualDeliveryCheck.error });
     const installDateCheck = parseOptionalDate(installationDate, 'installationDate');
     if (!installDateCheck.ok) return res.status(400).json({ error: installDateCheck.error });
-
-    const existingProj = await prisma.project.findUnique({
-      where: { projectNumber: cleanProjectNumber },
-      select: { id: true, offerId: true, customerId: true, workflowData: true },
-    });
-
-    // API-01: Strictly require valid existing offerId & customerId — never fabricate fake customers or OFF-TMP offers
-    let validOfferId: string | null = null;
-    let resolvedOfferCustomerId: string | null = null;
-    if (offerId !== undefined && offerId !== null && offerId !== '') {
-      if (!isUuid(offerId)) {
-        return res.status(400).json({ error: 'Invalid offerId UUID format.' });
-      }
-      const offerExists = await prisma.offer.findUnique({
-        where: { id: offerId },
-        select: { id: true, customerId: true },
-      });
-      if (!offerExists) {
-        return res.status(404).json({ error: 'Referenced offer not found.' });
-      }
-      validOfferId = offerExists.id;
-      resolvedOfferCustomerId = offerExists.customerId;
-    } else if (existingProj) {
-      validOfferId = existingProj.offerId;
-    } else {
-      return res.status(400).json({ error: 'A valid offerId UUID is required to create a project.' });
-    }
-
-    let validCustomerId: string | null = null;
-    if (customerId !== undefined && customerId !== null && customerId !== '') {
-      if (!isUuid(customerId)) {
-        return res.status(400).json({ error: 'Invalid customerId UUID format.' });
-      }
-      const custExists = await prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
-      if (!custExists) {
-        return res.status(404).json({ error: 'Referenced customer not found.' });
-      }
-      validCustomerId = custExists.id;
-    } else if (existingProj) {
-      validCustomerId = existingProj.customerId;
-    } else if (resolvedOfferCustomerId) {
-      validCustomerId = resolvedOfferCustomerId;
-    } else {
-      return res.status(400).json({ error: 'A valid customerId UUID is required.' });
-    }
 
     const sigCheck = validateSignatureUrl(signatureUrl);
     if (!sigCheck.ok) {
@@ -167,54 +129,115 @@ projectsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
     }
 
     const incomingWorkflow = extractWorkflowData(req.body ?? {});
-    const mergedWorkflowData = incomingWorkflow
-      ? {
-          ...(existingProj?.workflowData && typeof existingProj.workflowData === 'object'
-            ? (existingProj.workflowData as Record<string, any>)
-            : {}),
-          ...incomingWorkflow,
-        }
-      : undefined;
 
-    const project = await prisma.project.upsert({
-      where: { projectNumber: cleanProjectNumber },
-      update: {
-        status: statusCheck.value,
-        procurementStatus,
-        procurementNotes,
-        responsibleUserId: responsibleUserId !== undefined ? validRespUser : undefined,
-        startDate: startDateCheck.value,
-        targetDeliveryDate: targetDeliveryCheck.value,
-        actualDeliveryDate: actualDeliveryCheck.value,
-        installationTeam,
-        installationDate: installDateCheck.value,
-        installationAddress,
-        installationContact,
-        installationMinutes,
-        signatureUrl,
-        ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
-      },
-      create: {
-        projectNumber: cleanProjectNumber,
-        offerId: validOfferId,
-        customerId: validCustomerId,
-        status: statusCheck.value,
-        procurementStatus,
-        procurementNotes,
-        responsibleUserId: validRespUser,
-        startDate: startDateCheck.value ?? undefined,
-        targetDeliveryDate: targetDeliveryCheck.value ?? undefined,
-        actualDeliveryDate: actualDeliveryCheck.value ?? undefined,
-        installationTeam,
-        installationDate: installDateCheck.value ?? undefined,
-        installationAddress,
-        installationContact,
-        installationMinutes,
-        signatureUrl,
-        ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
-      },
-      include: { customer: true, offer: true, responsibleUser: { select: SAFE_PROFILE_SELECT } },
+    // API-14: Transactional lookup + workflowData merge + status preservation on partial updates
+    const txResult = await prisma.$transaction(async (tx) => {
+      const existingProj = await tx.project.findUnique({
+        where: { projectNumber: cleanProjectNumber },
+        select: { id: true, offerId: true, customerId: true, status: true, workflowData: true },
+      });
+
+      let validOfferId: string | null = null;
+      let resolvedOfferCustomerId: string | null = null;
+      if (offerId !== undefined && offerId !== null && offerId !== '') {
+        if (!isUuid(offerId)) {
+          return { errorStatus: 400, error: 'Invalid offerId UUID format.' } as const;
+        }
+        const offerExists = await tx.offer.findUnique({
+          where: { id: offerId },
+          select: { id: true, customerId: true },
+        });
+        if (!offerExists) {
+          return { errorStatus: 404, error: 'Referenced offer not found.' } as const;
+        }
+        validOfferId = offerExists.id;
+        resolvedOfferCustomerId = offerExists.customerId;
+      } else if (existingProj) {
+        validOfferId = existingProj.offerId;
+      } else {
+        return { errorStatus: 400, error: 'A valid offerId UUID is required to create a project.' } as const;
+      }
+
+      let validCustomerId: string | null = null;
+      if (customerId !== undefined && customerId !== null && customerId !== '') {
+        if (!isUuid(customerId)) {
+          return { errorStatus: 400, error: 'Invalid customerId UUID format.' } as const;
+        }
+        const custExists = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+        if (!custExists) {
+          return { errorStatus: 404, error: 'Referenced customer not found.' } as const;
+        }
+        if (resolvedOfferCustomerId && resolvedOfferCustomerId !== custExists.id) {
+          return {
+            errorStatus: 400,
+            error: 'customerId does not match the customer of the referenced offer.',
+          } as const;
+        }
+        validCustomerId = custExists.id;
+      } else if (existingProj) {
+        validCustomerId = existingProj.customerId;
+      } else if (resolvedOfferCustomerId) {
+        validCustomerId = resolvedOfferCustomerId;
+      } else {
+        return { errorStatus: 400, error: 'A valid customerId UUID is required.' } as const;
+      }
+
+      const mergedWorkflowData = incomingWorkflow
+        ? {
+            ...(existingProj?.workflowData && typeof existingProj.workflowData === 'object'
+              ? (existingProj.workflowData as Record<string, any>)
+              : {}),
+            ...incomingWorkflow,
+          }
+        : undefined;
+
+      const project = await tx.project.upsert({
+        where: { projectNumber: cleanProjectNumber },
+        update: {
+          // Preserve existing status when omitted in partial updates (API-14)
+          ...(hasExplicitStatus ? { status: statusCheck.value } : {}),
+          ...(procurementStatus !== undefined ? { procurementStatus } : {}),
+          ...(procurementNotes !== undefined ? { procurementNotes } : {}),
+          ...(responsibleUserId !== undefined ? { responsibleUserId: validRespUser } : {}),
+          ...(startDate !== undefined ? { startDate: startDateCheck.value } : {}),
+          ...(targetDeliveryDate !== undefined ? { targetDeliveryDate: targetDeliveryCheck.value } : {}),
+          ...(actualDeliveryDate !== undefined ? { actualDeliveryDate: actualDeliveryCheck.value } : {}),
+          ...(installationTeam !== undefined ? { installationTeam } : {}),
+          ...(installationDate !== undefined ? { installationDate: installDateCheck.value } : {}),
+          ...(installationAddress !== undefined ? { installationAddress } : {}),
+          ...(installationContact !== undefined ? { installationContact } : {}),
+          ...(installationMinutes !== undefined ? { installationMinutes } : {}),
+          ...(signatureUrl !== undefined ? { signatureUrl } : {}),
+          ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
+        },
+        create: {
+          projectNumber: cleanProjectNumber,
+          offerId: validOfferId,
+          customerId: validCustomerId,
+          status: statusCheck.value,
+          procurementStatus,
+          procurementNotes,
+          responsibleUserId: validRespUser,
+          startDate: startDateCheck.value ?? undefined,
+          targetDeliveryDate: targetDeliveryCheck.value ?? undefined,
+          actualDeliveryDate: actualDeliveryCheck.value ?? undefined,
+          installationTeam,
+          installationDate: installDateCheck.value ?? undefined,
+          installationAddress,
+          installationContact,
+          installationMinutes,
+          signatureUrl,
+          ...(mergedWorkflowData !== undefined ? { workflowData: mergedWorkflowData } : {}),
+        },
+        include: { customer: true, offer: true, responsibleUser: { select: SAFE_PROFILE_SELECT } },
+      });
+      return { project } as const;
     });
+
+    if ('error' in txResult && txResult.error) {
+      return res.status(txResult.errorStatus).json({ error: txResult.error });
+    }
+    const project = txResult.project;
     void recordAudit(prisma, req as AuthenticatedRequest, {
       action: 'PROJECT_SAVED',
       entityType: 'Project',

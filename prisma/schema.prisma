@@ -394,6 +394,7 @@ model PurchaseInvoice {
 
   @@index([projectId])
   @@index([status])
+  @@index([issueDate])
   @@map("purchase_invoices")
 }
 
@@ -404,6 +405,7 @@ model SalesInvoice {
   invoiceType                String   @map("invoice_type")
   status                     String   @default("ISSUED")
   customerId                 String   @map("customer_id")
+  customerName               String?  @map("customer_name")
   offerId                    String?  @map("offer_id")
   projectId                  String?  @map("project_id")
   issueDate                  String   @map("issue_date")
@@ -427,6 +429,7 @@ model SalesInvoice {
   @@index([projectId])
   @@index([offerId])
   @@index([status])
+  @@index([issueDate])
   @@map("sales_invoices")
 }
 
@@ -435,6 +438,7 @@ model DispatchNote {
   dispatchNumber  String   @unique @map("dispatch_number")
   status          String   @default("DRAFT")
   customerId      String   @map("customer_id")
+  customerName    String?  @map("customer_name")
   projectId       String?  @map("project_id")
   offerId         String?  @map("offer_id")
   salesInvoiceId  String?  @map("sales_invoice_id")
@@ -449,6 +453,8 @@ model DispatchNote {
 
   @@index([customerId])
   @@index([projectId])
+  @@index([salesInvoiceId])
+  @@index([offerId])
   @@map("dispatch_notes")
 }
 
@@ -474,6 +480,7 @@ model PaymentRecord {
   @@index([projectId])
   @@index([salesInvoiceId])
   @@index([purchaseInvoiceId])
+  @@index([date])
   @@map("payment_records")
 }
 

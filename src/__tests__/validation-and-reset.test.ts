@@ -5,9 +5,13 @@ import {
   parseOptionalDate,
   parseFiniteNumber,
   parsePagination,
+  buildPrismaPaginationArgs,
   handleRouteError,
   OFFER_STATUSES,
 } from '../validation';
+import { formatOfferForResponse } from '../lib/formatters';
+import { formatDocumentForList } from '../storage';
+import { buildCorsOptions } from '../security';
 
 describe('Validation helpers (API-07, API-08)', () => {
   it('validates UUIDs strictly', () => {
@@ -81,5 +85,60 @@ describe('Validation helpers (API-07, API-08)', () => {
     handleRouteError(r500.res, new Error('SELECT * FROM secret_table'), 'test');
     expect(r500.getStatus()).toBe(500);
     expect(r500.getBody().error).toBe('Internal server error.');
+  });
+});
+
+describe('Round 2 API Hardening (API-15, API-18, API-19, API-21)', () => {
+  it('rejects booleans, arrays, objects, and blank strings in parseFiniteNumber (API-19)', () => {
+    expect(parseFiniteNumber(true, 'price').ok).toBe(false);
+    expect(parseFiniteNumber(false, 'price').ok).toBe(false);
+    expect(parseFiniteNumber([], 'price').ok).toBe(false);
+    expect(parseFiniteNumber({}, 'price').ok).toBe(false);
+    expect(parseFiniteNumber('   ', 'price').ok).toBe(false);
+    expect(parseFiniteNumber('   ', 'price', { defaultVal: 10 })).toEqual({ ok: true, value: 10 });
+    expect(parseFiniteNumber('42.5', 'price')).toEqual({ ok: true, value: 42.5 });
+  });
+
+  it('exposes pagination and rate-limit headers in CORS config (API-15)', () => {
+    const cors = buildCorsOptions();
+    expect(cors.exposedHeaders).toEqual(
+      expect.arrayContaining(['X-Total-Count', 'X-Request-Id', 'Retry-After'])
+    );
+  });
+
+  it('avoids fabricating empty items[] and strips duplicate spec keys in formatOfferForResponse (API-18)', () => {
+    const nested = formatOfferForResponse({ id: 'o1', totalAmount: '500.00' });
+    expect('items' in nested).toBe(false);
+
+    const full = formatOfferForResponse({
+      id: 'o2',
+      totalAmount: '500.00',
+      items: [
+        {
+          id: 'i1',
+          quantity: 1,
+          unitPrice: '500',
+          totalPrice: '500',
+          offerItemSpecifications: [
+            { id: 's1', specificationKeyId: 'k1', specificationOptionId: 'opt1', customPriceModifier: '50' },
+            { id: 's2', specificationKeyId: null, specificationOptionId: null, customKeyName: 'Extra', customPriceModifier: '25' },
+          ],
+        },
+      ],
+    });
+    expect('offerItemSpecifications' in full.items[0]).toBe(false);
+    expect(full.items[0].specifications[0].customPriceModifier).toBeUndefined();
+    expect(full.items[0].specifications[1].customPriceModifier).toBe(25);
+  });
+
+  it('handles SQL-omitted fileUrl cleanly and caps unpaginated list queries (API-21)', () => {
+    const projected = formatDocumentForList({ id: 'd1', title: 'Spec.pdf', fileName: 'spec.pdf', sizeBytes: 12000 }, false);
+    expect(projected.fileUrl).toBe('');
+    expect(projected.hasFile).toBe(true);
+
+    const noFile = formatDocumentForList({ id: 'd2', title: 'Quote', fileName: null, sizeBytes: null }, false);
+    expect(noFile.hasFile).toBe(false);
+
+    expect(buildPrismaPaginationArgs({ isPaginated: false }).take).toBe(500);
   });
 });

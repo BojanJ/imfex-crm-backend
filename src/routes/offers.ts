@@ -21,21 +21,24 @@ offersRouter.get('/', async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const offers = await prisma.offer.findMany({
-      include: {
-        customer: true,
-        createdByUser: { select: SAFE_PROFILE_SELECT },
-        items: {
-          include: {
-            offerItemSpecifications: true,
+    const [offers, totalCount] = await Promise.all([
+      prisma.offer.findMany({
+        include: {
+          customer: true,
+          createdByUser: { select: SAFE_PROFILE_SELECT },
+          items: {
+            include: {
+              offerItemSpecifications: true,
+            },
           },
         },
-      },
-      orderBy: { createdAt: 'desc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.offer.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.offer.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(offers.map(formatOfferForResponse));
   } catch (error) {
@@ -120,64 +123,173 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
     const totalAmountCheck = parseFiniteNumber(totalAmount, 'totalAmount', { min: 0, defaultVal: 0 });
     if (!totalAmountCheck.ok) return res.status(400).json({ error: totalAmountCheck.error });
 
+    // API-13: Validate line items (no negative prices, finite dimensions, bounded count) & compute server-side totals
+    const validatedItems: Array<{
+      productId: string | null;
+      productModelId: string | null;
+      customTitle: string;
+      serviceTypes: string[];
+      widthMm: number | null;
+      heightMm: number | null;
+      quantity: number;
+      unitPrice: number;
+      totalPrice: number;
+      rawSpecs: any[];
+    }> = [];
+
+    if (items !== undefined) {
+      if (!Array.isArray(items)) {
+        return res.status(400).json({ error: 'items must be an array.' });
+      }
+      if (items.length > 200) {
+        return res.status(400).json({ error: 'items exceeds maximum allowed count (200).' });
+      }
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const qtyCheck = parseFiniteNumber(item?.quantity, `items[${i}].quantity`, {
+          min: 1,
+          max: 100000,
+          defaultVal: 1,
+          integer: true,
+        });
+        if (!qtyCheck.ok) return res.status(400).json({ error: qtyCheck.error });
+
+        const unitPriceCheck = parseFiniteNumber(item?.unitPrice, `items[${i}].unitPrice`, {
+          min: 0,
+          defaultVal: 0,
+        });
+        if (!unitPriceCheck.ok) return res.status(400).json({ error: unitPriceCheck.error });
+
+        let widthVal: number | null = null;
+        if (item?.widthMm !== undefined && item?.widthMm !== null && item?.widthMm !== '') {
+          const wCheck = parseFiniteNumber(item.widthMm, `items[${i}].widthMm`, { min: 0, max: 1000000, integer: true });
+          if (!wCheck.ok) return res.status(400).json({ error: wCheck.error });
+          widthVal = wCheck.value;
+        }
+        let heightVal: number | null = null;
+        if (item?.heightMm !== undefined && item?.heightMm !== null && item?.heightMm !== '') {
+          const hCheck = parseFiniteNumber(item.heightMm, `items[${i}].heightMm`, { min: 0, max: 1000000, integer: true });
+          if (!hCheck.ok) return res.status(400).json({ error: hCheck.error });
+          heightVal = hCheck.value;
+        }
+
+        const computedLineTotal = Math.round(unitPriceCheck.value * qtyCheck.value * 100) / 100;
+        const rawSpecs = Array.isArray(item?.specifications)
+          ? item.specifications
+          : Array.isArray(item?.offerItemSpecifications)
+          ? item.offerItemSpecifications
+          : [];
+
+        validatedItems.push({
+          productId: isUuid(item?.productId) ? item.productId : null,
+          productModelId: isUuid(item?.productModelId) ? item.productModelId : null,
+          customTitle: typeof item?.customTitle === 'string' ? item.customTitle.slice(0, 500) : '',
+          serviceTypes: Array.isArray(item?.serviceTypes)
+            ? item.serviceTypes.filter((s: unknown): s is string => typeof s === 'string')
+            : [],
+          widthMm: widthVal,
+          heightMm: heightVal,
+          quantity: qtyCheck.value,
+          unitPrice: unitPriceCheck.value,
+          totalPrice: computedLineTotal,
+          rawSpecs,
+        });
+      }
+    }
+
+    const hasItemsPayload = Array.isArray(items);
+    const computedSubtotal = hasItemsPayload
+      ? Math.round(validatedItems.reduce((sum, it) => sum + it.totalPrice, 0) * 100) / 100
+      : subtotalCheck.value;
+    const computedDiscountAmount = hasItemsPayload
+      ? Math.round(((computedSubtotal * discountRateCheck.value) / 100) * 100) / 100
+      : discountAmountCheck.value;
+    const taxableSubtotal = Math.max(0, Math.round((computedSubtotal - computedDiscountAmount) * 100) / 100);
+    const computedTaxAmount = hasItemsPayload
+      ? Math.round(((taxableSubtotal * taxRateCheck.value) / 100) * 100) / 100
+      : taxAmountCheck.value;
+    const computedTotalAmount = hasItemsPayload
+      ? Math.round((taxableSubtotal + computedTaxAmount) * 100) / 100
+      : totalAmountCheck.value;
+
     let validUserId: string | null = null;
     if (isUuid(createdByUserId)) {
       const userExists = await prisma.profile.findUnique({ where: { id: createdByUserId }, select: { id: true } });
       if (userExists) validUserId = userExists.id;
     }
 
-    // API-02: Wrap offer upsert + item replacement + specification snapshots in a single transaction
-    const fullOffer = await prisma.$transaction(
+    // API-02 + API-13: Wrap offer upsert + item replacement + specification snapshots in a single transaction
+    // Only update when matching by existing UUID; reject duplicate offerNumber with 409 Conflict
+    const txResult = await prisma.$transaction(
       async (tx) => {
-        let existingOffer = null;
-        if (isUuid(id)) {
-          existingOffer = await tx.offer.findUnique({ where: { id } });
-        }
-        if (!existingOffer && offerNumber) {
-          existingOffer = await tx.offer.findUnique({ where: { offerNumber: String(offerNumber) } });
-        }
+        const existingOffer = isUuid(id) ? await tx.offer.findUnique({ where: { id } }) : null;
 
         let offer;
         if (existingOffer) {
+          const effTaxRate =
+            taxRate !== undefined && taxRate !== null && taxRate !== '' ? taxRateCheck.value : Number(existingOffer.taxRate);
+          const effDiscountRate =
+            discountRate !== undefined && discountRate !== null && discountRate !== ''
+              ? discountRateCheck.value
+              : Number(existingOffer.discountRate);
+          const nextSubtotal = hasItemsPayload
+            ? computedSubtotal
+            : subtotal !== undefined && subtotal !== null && subtotal !== ''
+            ? subtotalCheck.value
+            : Number(existingOffer.subtotal);
+          const nextDiscount = hasItemsPayload
+            ? Math.round(((nextSubtotal * effDiscountRate) / 100) * 100) / 100
+            : discountAmount !== undefined && discountAmount !== null && discountAmount !== ''
+            ? discountAmountCheck.value
+            : Number(existingOffer.discountAmount);
+          const nextTaxable = Math.max(0, Math.round((nextSubtotal - nextDiscount) * 100) / 100);
+          const nextTax = hasItemsPayload
+            ? Math.round(((nextTaxable * effTaxRate) / 100) * 100) / 100
+            : taxAmount !== undefined && taxAmount !== null && taxAmount !== ''
+            ? taxAmountCheck.value
+            : Number(existingOffer.taxAmount);
+          const nextTotal = hasItemsPayload
+            ? Math.round((nextTaxable + nextTax) * 100) / 100
+            : totalAmount !== undefined && totalAmount !== null && totalAmount !== ''
+            ? totalAmountCheck.value
+            : Number(existingOffer.totalAmount);
+
           offer = await tx.offer.update({
             where: { id: existingOffer.id },
             data: {
               customerId,
               createdByUserId: validUserId ?? existingOffer.createdByUserId,
               status: status !== undefined ? statusCheck.value : existingOffer.status,
-              taxRate: taxRate !== undefined && taxRate !== null && taxRate !== '' ? taxRateCheck.value : existingOffer.taxRate,
-              discountRate:
-                discountRate !== undefined && discountRate !== null && discountRate !== ''
-                  ? discountRateCheck.value
-                  : existingOffer.discountRate,
-              discountAmount:
-                discountAmount !== undefined && discountAmount !== null && discountAmount !== ''
-                  ? discountAmountCheck.value
-                  : existingOffer.discountAmount,
-              subtotal: subtotal !== undefined && subtotal !== null && subtotal !== '' ? subtotalCheck.value : existingOffer.subtotal,
-              taxAmount:
-                taxAmount !== undefined && taxAmount !== null && taxAmount !== '' ? taxAmountCheck.value : existingOffer.taxAmount,
-              totalAmount:
-                totalAmount !== undefined && totalAmount !== null && totalAmount !== ''
-                  ? totalAmountCheck.value
-                  : existingOffer.totalAmount,
+              taxRate: effTaxRate,
+              discountRate: effDiscountRate,
+              discountAmount: nextDiscount,
+              subtotal: nextSubtotal,
+              taxAmount: nextTax,
+              totalAmount: nextTotal,
               ...(validUntil !== undefined ? { validUntil: validUntilCheck.value ?? null } : {}),
             },
           });
         } else {
           let uniqueOfferNumber = offerNumber ? String(offerNumber).trim() : '';
-          if (!uniqueOfferNumber) {
+          if (uniqueOfferNumber) {
+            const duplicate = await tx.offer.findUnique({
+              where: { offerNumber: uniqueOfferNumber },
+              select: { id: true },
+            });
+            if (duplicate) {
+              return { conflict: `An offer with number "${uniqueOfferNumber}" already exists.` as const };
+            }
+          } else {
             const count = await tx.offer.count();
             uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${String(count + 1).padStart(4, '0')}`;
-          }
-
-          let conflict = await tx.offer.findUnique({ where: { offerNumber: uniqueOfferNumber }, select: { id: true } });
-          let attempts = 0;
-          while (conflict && attempts < 10) {
-            attempts++;
-            const rand = Math.floor(1000 + Math.random() * 9000);
-            uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${rand}`;
-            conflict = await tx.offer.findUnique({ where: { offerNumber: uniqueOfferNumber }, select: { id: true } });
+            let conflict = await tx.offer.findUnique({ where: { offerNumber: uniqueOfferNumber }, select: { id: true } });
+            let attempts = 0;
+            while (conflict && attempts < 10) {
+              attempts++;
+              const rand = Math.floor(1000 + Math.random() * 9000);
+              uniqueOfferNumber = `OFF-${new Date().getFullYear()}-${rand}`;
+              conflict = await tx.offer.findUnique({ where: { offerNumber: uniqueOfferNumber }, select: { id: true } });
+            }
           }
 
           offer = await tx.offer.create({
@@ -189,25 +301,20 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
               status: statusCheck.value,
               taxRate: taxRateCheck.value,
               discountRate: discountRateCheck.value,
-              discountAmount: discountAmountCheck.value,
-              subtotal: subtotalCheck.value,
-              taxAmount: taxAmountCheck.value,
-              totalAmount: totalAmountCheck.value,
+              discountAmount: computedDiscountAmount,
+              subtotal: computedSubtotal,
+              taxAmount: computedTaxAmount,
+              totalAmount: computedTotalAmount,
               validUntil: validUntilCheck.value ?? null,
             },
           });
         }
 
-        if (Array.isArray(items)) {
+        if (hasItemsPayload) {
           const keyIds = new Set<string>();
           const optIds = new Set<string>();
-          for (const item of items) {
-            const rawSpecs = Array.isArray(item?.specifications)
-              ? item.specifications
-              : Array.isArray(item?.offerItemSpecifications)
-              ? item.offerItemSpecifications
-              : [];
-            for (const spec of rawSpecs) {
+          for (const item of validatedItems) {
+            for (const spec of item.rawSpecs) {
               if (isUuid(spec?.specificationKeyId)) keyIds.add(spec.specificationKeyId);
               if (isUuid(spec?.specificationOptionId)) optIds.add(spec.specificationOptionId);
             }
@@ -226,36 +333,24 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
 
           await tx.offerItem.deleteMany({ where: { offerId: offer.id } });
 
-          for (const item of items) {
+          for (const item of validatedItems) {
             const createdItem = await tx.offerItem.create({
               data: {
                 offerId: offer.id,
-                productId: isUuid(item?.productId) ? item.productId : null,
-                productModelId: isUuid(item?.productModelId) ? item.productModelId : null,
-                customTitle: item?.customTitle || '',
-                serviceTypes: Array.isArray(item?.serviceTypes) ? item.serviceTypes : [],
-                widthMm:
-                  item?.widthMm !== undefined && item?.widthMm !== null && item?.widthMm !== ''
-                    ? Math.round(Number(item.widthMm))
-                    : null,
-                heightMm:
-                  item?.heightMm !== undefined && item?.heightMm !== null && item?.heightMm !== ''
-                    ? Math.round(Number(item.heightMm))
-                    : null,
-                quantity: Math.max(1, Math.round(Number(item?.quantity ?? 1) || 1)),
-                unitPrice: Number.isFinite(Number(item?.unitPrice)) ? Number(item.unitPrice) : 0,
-                totalPrice: Number.isFinite(Number(item?.totalPrice)) ? Number(item.totalPrice) : 0,
+                productId: item.productId,
+                productModelId: item.productModelId,
+                customTitle: item.customTitle,
+                serviceTypes: item.serviceTypes,
+                widthMm: item.widthMm,
+                heightMm: item.heightMm,
+                quantity: item.quantity,
+                unitPrice: item.unitPrice,
+                totalPrice: item.totalPrice,
               },
             });
 
-            const rawSpecs = Array.isArray(item?.specifications)
-              ? item.specifications
-              : Array.isArray(item?.offerItemSpecifications)
-              ? item.offerItemSpecifications
-              : [];
-
             const specRows: any[] = [];
-            for (const spec of rawSpecs) {
+            for (const spec of item.rawSpecs) {
               if (isUuid(spec?.specificationKeyId) && specKeyMap.has(spec.specificationKeyId)) {
                 const keyInfo = specKeyMap.get(spec.specificationKeyId)!;
                 const optInfo = isUuid(spec?.specificationOptionId) ? specOptMap.get(spec.specificationOptionId) : undefined;
@@ -265,7 +360,12 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
                   specificationOptionId: optInfo ? optInfo.id : null,
                   customValue: spec.customValue || optInfo?.label || null,
                   customKeyName: spec.customKeyName || keyInfo.name,
-                  customPriceModifier: Number.isFinite(Number(spec.customPriceModifier)) ? Number(spec.customPriceModifier) : 0,
+                  // API-18: Keep customPriceModifier at 0 on standard catalog options so priceModifier is never double-counted
+                  customPriceModifier: optInfo
+                    ? 0
+                    : Number.isFinite(Number(spec.customPriceModifier))
+                    ? Number(spec.customPriceModifier)
+                    : 0,
                 });
               } else if (spec?.customKeyName || spec?.customValue) {
                 specRows.push({
@@ -284,7 +384,7 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
           }
         }
 
-        return tx.offer.findUnique({
+        const loaded = await tx.offer.findUnique({
           where: { id: offer.id },
           include: {
             customer: true,
@@ -296,9 +396,15 @@ offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, 
             },
           },
         });
+        return { offer: loaded };
       },
       { timeout: 20000 }
     );
+
+    if ('conflict' in txResult && txResult.conflict) {
+      return res.status(409).json({ error: txResult.conflict });
+    }
+    const fullOffer = txResult.offer;
 
     void recordAudit(prisma, req as AuthenticatedRequest, {
       action: 'OFFER_SAVED',

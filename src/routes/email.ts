@@ -107,6 +107,12 @@ emailRouter.post('/send-offer', requireRole(...ROLE_GROUPS.EMAIL_OFFER), emailLi
       return res.status(400).json({ error: result.error.message });
     }
 
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'EMAIL_OFFER_SENT',
+      entityType: 'Offer',
+      metadata: { to: String(to).trim(), offerNumber: offerNumber || null },
+    });
+
     res.json({ success: true, id: result.data?.id });
   } catch (error: any) {
     logger.error('send_offer_email_error', { error: error?.message || String(error) });

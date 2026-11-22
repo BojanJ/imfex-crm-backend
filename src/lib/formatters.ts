@@ -24,7 +24,7 @@ export const formatProductForResponse = (p: any) => {
 
 export const formatOfferForResponse = (offer: any) => {
   if (!offer) return offer;
-  return {
+  const formatted: Record<string, any> = {
     ...offer,
     taxRate: Number(offer.taxRate ?? 0),
     discountRate: Number(offer.discountRate ?? 0),
@@ -32,23 +32,34 @@ export const formatOfferForResponse = (offer: any) => {
     subtotal: Number(offer.subtotal ?? 0),
     taxAmount: Number(offer.taxAmount ?? 0),
     totalAmount: Number(offer.totalAmount ?? 0),
-    items: (offer.items || []).map((item: any) => ({
-      ...item,
-      quantity: Number(item.quantity ?? 1),
-      unitPrice: Number(item.unitPrice ?? 0),
-      totalPrice: Number(item.totalPrice ?? 0),
-      specifications: (item.offerItemSpecifications || item.specifications || []).map((s: any) => ({
-        specificationKeyId: s.specificationKeyId || `custom-${s.id}`,
-        specificationOptionId: s.specificationOptionId || undefined,
-        customValue: s.customValue || undefined,
-        customKeyName: s.customKeyName || undefined,
-        customPriceModifier:
-          s.customPriceModifier !== undefined && s.customPriceModifier !== null
-            ? Number(s.customPriceModifier)
-            : undefined,
-      })),
-    })),
   };
+
+  // API-18: Only include `items` when explicitly loaded; avoid wiping items to [] on nested relations
+  if (Array.isArray(offer.items)) {
+    formatted.items = offer.items.map((item: any) => {
+      const { offerItemSpecifications: rawOfferItemSpecs, ...restItem } = item;
+      const rawSpecs = rawOfferItemSpecs || item.specifications || [];
+      return {
+        ...restItem,
+        quantity: Number(item.quantity ?? 1),
+        unitPrice: Number(item.unitPrice ?? 0),
+        totalPrice: Number(item.totalPrice ?? 0),
+        specifications: rawSpecs.map((s: any) => ({
+          specificationKeyId: s.specificationKeyId || `custom-${s.id}`,
+          specificationOptionId: s.specificationOptionId || undefined,
+          customValue: s.customValue || undefined,
+          customKeyName: s.customKeyName || undefined,
+          // Only expose customPriceModifier on custom specs (not standard catalog options) to prevent double-counting
+          customPriceModifier:
+            !s.specificationOptionId && s.customPriceModifier !== undefined && s.customPriceModifier !== null
+              ? Number(s.customPriceModifier)
+              : undefined,
+        })),
+      };
+    });
+  }
+
+  return formatted;
 };
 
 const WORKFLOW_KEYS = [

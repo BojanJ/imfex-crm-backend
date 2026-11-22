@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { AuthenticatedRequest, invalidateAuthUserCache, requireRole } from '../auth';
 import { parsePagination, buildPrismaPaginationArgs, handleRouteError } from '../validation';
+import { recordAudit } from '../audit';
 
 function isAdminDbToolsAllowed(): boolean {
   if (process.env.NODE_ENV === 'production') {
@@ -31,14 +32,29 @@ adminRouter.post('/admin/clean-database', requireRole('SUPER_ADMIN'), async (req
       (c) => (c.name && c.name.includes('?')) || (c.companyName && c.companyName.includes('?'))
     );
 
-    for (const c of corruptedCust) {
-      await prisma.offerItem.deleteMany({ where: { offer: { customerId: c.id } } });
-      await prisma.offer.deleteMany({ where: { customerId: c.id } });
-      await prisma.project.deleteMany({ where: { customerId: c.id } });
-      await prisma.serviceTicket.deleteMany({ where: { customerId: c.id } });
-      await prisma.installedItem.deleteMany({ where: { customerId: c.id } });
-      await prisma.customer.delete({ where: { id: c.id } });
-    }
+    // API-11: Wrap clean-database deletes in a single transaction in strict child->parent FK order
+    await prisma.$transaction(
+      async (tx) => {
+        for (const c of corruptedCust) {
+          await tx.clientDocument.deleteMany({ where: { customerId: c.id } });
+          await tx.serviceTicket.deleteMany({ where: { customerId: c.id } });
+          await tx.installedItem.deleteMany({ where: { customerId: c.id } });
+          await tx.calendarEvent.deleteMany({ where: { customerId: c.id } });
+          await tx.project.deleteMany({ where: { customerId: c.id } });
+          await tx.offerItemSpecification.deleteMany({ where: { offerItem: { offer: { customerId: c.id } } } });
+          await tx.offerItem.deleteMany({ where: { offer: { customerId: c.id } } });
+          await tx.offer.deleteMany({ where: { customerId: c.id } });
+          await tx.customer.delete({ where: { id: c.id } });
+        }
+      },
+      { timeout: 30000 }
+    );
+
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'ADMIN_CLEAN_DATABASE',
+      entityType: 'System',
+      metadata: { purgedCorruptedCount: corruptedCust.length },
+    });
 
     res.json({
       success: true,
@@ -72,33 +88,45 @@ adminRouter.post('/admin/reset-database', requireRole('SUPER_ADMIN'), async (req
       return res.status(400).json({ error: 'Active super admin account not found.' });
     }
 
-    await prisma.offerItemSpecification.deleteMany();
-    await prisma.offerItem.deleteMany();
-    await prisma.offer.deleteMany();
-    await prisma.project.deleteMany();
-    await prisma.serviceTicket.deleteMany();
-    await prisma.installedItem.deleteMany();
-    await prisma.clientDocument.deleteMany();
-    await prisma.calendarEvent.deleteMany();
-    await prisma.paymentRecord.deleteMany();
-    await prisma.dispatchNote.deleteMany();
-    await prisma.salesInvoice.deleteMany();
-    await prisma.purchaseInvoice.deleteMany();
-    await prisma.inventoryMovement.deleteMany();
-    await prisma.customer.deleteMany();
-    await prisma.specificationOption.deleteMany();
-    await prisma.specificationKey.deleteMany();
-    await prisma.productModel.deleteMany();
-    await prisma.product.deleteMany();
-    await prisma.productCategory.deleteMany();
+    // API-11: Wrap full reset in a single transaction deleting child tables before parents (Project before Offer, etc.)
+    await prisma.$transaction(
+      async (tx) => {
+        await tx.clientDocument.deleteMany();
+        await tx.calendarEvent.deleteMany();
+        await tx.serviceTicket.deleteMany();
+        await tx.installedItem.deleteMany();
+        await tx.project.deleteMany();
+        await tx.offerItemSpecification.deleteMany();
+        await tx.offerItem.deleteMany();
+        await tx.offer.deleteMany();
+        await tx.paymentRecord.deleteMany();
+        await tx.dispatchNote.deleteMany();
+        await tx.salesInvoice.deleteMany();
+        await tx.purchaseInvoice.deleteMany();
+        await tx.inventoryMovement.deleteMany();
+        await tx.customer.deleteMany();
+        await tx.specificationOption.deleteMany();
+        await tx.specificationKey.deleteMany();
+        await tx.productModel.deleteMany();
+        await tx.product.deleteMany();
+        await tx.productCategory.deleteMany();
 
-    // Preserve the executing SUPER_ADMIN account and its existing password hash
-    await prisma.profile.deleteMany({
-      where: {
-        id: { not: currentAdmin.id },
+        // Preserve the executing SUPER_ADMIN account and its existing password hash
+        await tx.profile.deleteMany({
+          where: {
+            id: { not: currentAdmin.id },
+          },
+        });
       },
-    });
+      { timeout: 30000 }
+    );
     invalidateAuthUserCache();
+
+    void recordAudit(prisma, req, {
+      action: 'ADMIN_RESET_DATABASE',
+      entityType: 'System',
+      metadata: { preservedAdminEmail: currentAdmin.email },
+    });
 
     res.json({
       success: true,
@@ -115,12 +143,15 @@ adminRouter.get('/audit-logs', requireRole('SUPER_ADMIN'), async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>, 200);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const logs = await prisma.auditLog.findMany({
-      orderBy: { createdAt: 'desc' },
-      ...(page.value.isPaginated ? buildPrismaPaginationArgs(page.value) : { take: 100 }),
-    });
+    const [logs, totalCount] = await Promise.all([
+      prisma.auditLog.findMany({
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...(page.value.isPaginated ? buildPrismaPaginationArgs(page.value) : { take: 100 }),
+      }),
+      page.value.isPaginated ? prisma.auditLog.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.auditLog.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(logs);
   } catch (error) {

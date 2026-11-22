@@ -34,7 +34,8 @@ export function createApp() {
   const standardJson = express.json({ limit: '1mb' });
   const largeJson = express.json({ limit: '15mb' });
   app.use((req, res, next) => {
-    if (req.path.startsWith('/api/email/') || req.path === '/api/client-documents') {
+    const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+    if (normalizedPath.startsWith('/api/email/') || normalizedPath === '/api/client-documents') {
       return largeJson(req, res, next);
     }
     return standardJson(req, res, next);
@@ -81,6 +82,28 @@ export function createApp() {
   app.use('/api/calendar-events', calendarRouter);
   app.use('/api', financeRouter);
   app.use('/api/company-settings', settingsRouter);
+
+  // JSON 404 fallback for unknown /api/* routes (API-19)
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  // Global Express JSON error handler (CORS rejections, malformed JSON, payload too large) (API-19)
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (res.headersSent) return;
+    if (err?.type === 'entity.too.large' || err?.status === 413) {
+      return res.status(413).json({ error: 'Request payload is too large.' });
+    }
+    if (err instanceof SyntaxError && (err as any)?.status === 400 && 'body' in err) {
+      return res.status(400).json({ error: 'Malformed JSON request body.' });
+    }
+    if (typeof err?.message === 'string' && err.message.includes('not allowed by CORS')) {
+      return res.status(403).json({ error: 'Origin not allowed by CORS policy.' });
+    }
+    return res.status(err?.status && err.status >= 400 && err.status < 600 ? err.status : 500).json({
+      error: 'Internal server error.',
+    });
+  });
 
   return app;
 }

@@ -93,6 +93,16 @@ describe('Modular Express App & Routing (IMP-01)', () => {
       body: JSON.stringify({ token: 'short', newPassword: '123' }),
     });
     expect(resetRes.status).toBe(400);
+
+    // Malformed JSON returns JSON 400 instead of Express HTML error page (API-19)
+    const malformedRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{invalid-json',
+    });
+    expect(malformedRes.status).toBe(400);
+    const malformedBody = (await malformedRes.json()) as { error?: string };
+    expect(malformedBody.error).toContain('Malformed JSON');
   });
 
   it('upgrades Supabase session pooler URLs (5432 -> 6543) with pgbouncer params', () => {

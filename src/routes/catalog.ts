@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { formatProductForResponse } from '../lib/formatters';
-import { ROLE_GROUPS, requireRole } from '../auth';
+import { AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import {
   isUuid,
   SPEC_INPUT_TYPES,
@@ -11,6 +11,7 @@ import {
   buildPrismaPaginationArgs,
   handleRouteError,
 } from '../validation';
+import { recordAudit } from '../audit';
 
 export const catalogRouter = Router();
 
@@ -20,13 +21,16 @@ catalogRouter.get('/categories', async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const categories = await prisma.productCategory.findMany({
-      include: { children: true },
-      orderBy: { createdAt: 'asc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+    const [categories, totalCount] = await Promise.all([
+      prisma.productCategory.findMany({
+        include: { children: true },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.productCategory.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.productCategory.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(categories);
   } catch (error) {
@@ -46,6 +50,28 @@ catalogRouter.post('/categories', requireRole(...ROLE_GROUPS.CATALOG_WRITE), asy
     }
     const cleanParentId = isUuid(parentId) ? parentId : null;
 
+    // API-19: Prevent self-parenting and ancestor cycles in category tree
+    if (isUuid(id) && cleanParentId) {
+      if (cleanParentId === id) {
+        return res.status(400).json({ error: 'A category cannot be its own parent.' });
+      }
+      let cursor: string | null = cleanParentId;
+      const visited = new Set<string>([id]);
+      let depth = 0;
+      while (cursor && depth < 32) {
+        if (visited.has(cursor)) {
+          return res.status(400).json({ error: 'Category hierarchy cannot contain cycles.' });
+        }
+        visited.add(cursor);
+        const parentRow: { parentId: string | null } | null = await prisma.productCategory.findUnique({
+          where: { id: cursor },
+          select: { parentId: true },
+        });
+        cursor = parentRow?.parentId ?? null;
+        depth++;
+      }
+    }
+
     let category;
     if (isUuid(id)) {
       category = await prisma.productCategory.upsert({
@@ -58,6 +84,12 @@ catalogRouter.post('/categories', requireRole(...ROLE_GROUPS.CATALOG_WRITE), asy
         data: { name: cleanName, parentId: cleanParentId },
       });
     }
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'CATEGORY_SAVED',
+      entityType: 'ProductCategory',
+      entityId: category.id,
+      metadata: { name: category.name },
+    });
     res.json(category);
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/categories');
@@ -71,6 +103,11 @@ catalogRouter.delete('/categories/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_D
       return res.status(400).json({ error: 'Invalid category ID format.' });
     }
     await prisma.productCategory.delete({ where: { id } });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'CATEGORY_DELETED',
+      entityType: 'ProductCategory',
+      entityId: id,
+    });
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/categories/:id');
@@ -83,21 +120,24 @@ catalogRouter.get('/products', async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const products = await prisma.product.findMany({
-      include: {
-        category: true,
-        models: true,
-        specificationKeys: {
-          include: {
-            options: true,
+    const [products, totalCount] = await Promise.all([
+      prisma.product.findMany({
+        include: {
+          category: true,
+          models: true,
+          specificationKeys: {
+            include: {
+              options: true,
+            },
           },
         },
-      },
-      orderBy: { createdAt: 'asc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.product.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.product.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(products.map(formatProductForResponse));
   } catch (error) {
@@ -153,7 +193,22 @@ catalogRouter.post('/products', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async
         : null;
     if (purchasePriceCheck && !purchasePriceCheck.ok) return res.status(400).json({ error: purchasePriceCheck.error });
 
+    if (models !== undefined) {
+      if (!Array.isArray(models) || models.length > 100) {
+        return res.status(400).json({ error: 'models must be an array of at most 100 items.' });
+      }
+      for (let i = 0; i < models.length; i++) {
+        if (models[i]?.basePrice !== undefined && models[i]?.basePrice !== null && models[i]?.basePrice !== '') {
+          const bpCheck = parseFiniteNumber(models[i].basePrice, `models[${i}].basePrice`, { min: 0 });
+          if (!bpCheck.ok) return res.status(400).json({ error: bpCheck.error });
+        }
+      }
+    }
+
     if (Array.isArray(specificationKeys)) {
+      if (specificationKeys.length > 100) {
+        return res.status(400).json({ error: 'specificationKeys exceeds maximum allowed count (100).' });
+      }
       for (const sk of specificationKeys) {
         if (sk?.inputType !== undefined) {
           const check = parseEnum(sk.inputType, SPEC_INPUT_TYPES, 'specificationKey.inputType');
@@ -169,47 +224,47 @@ catalogRouter.post('/products', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async
       ...(purchasePriceCheck?.ok ? { purchasePrice: purchasePriceCheck.value } : {}),
     };
 
-    const updatedProduct = await prisma.$transaction(
+    const txResult = await prisma.$transaction(
       async (tx) => {
-        const product = isUuid(id)
-          ? await tx.product.upsert({
-              where: { id },
-              update: {
-                name: cleanName,
-                code: cleanCode,
-                description: description ?? null,
-                isActive: isActive !== undefined ? Boolean(isActive) : true,
-                categoryId: cleanCategoryId,
-                ...stockFields,
-              },
-              create: {
-                id,
-                name: cleanName,
-                code: cleanCode,
-                description: description ?? null,
-                isActive: isActive !== undefined ? Boolean(isActive) : true,
-                categoryId: cleanCategoryId,
-                ...stockFields,
-              },
-            })
-          : await tx.product.upsert({
-              where: { code: cleanCode },
-              update: {
-                name: cleanName,
-                description: description ?? null,
-                isActive: isActive !== undefined ? Boolean(isActive) : true,
-                categoryId: cleanCategoryId,
-                ...stockFields,
-              },
-              create: {
-                name: cleanName,
-                code: cleanCode,
-                description: description ?? null,
-                isActive: isActive !== undefined ? Boolean(isActive) : true,
-                categoryId: cleanCategoryId,
-                ...stockFields,
-              },
-            });
+        // API-13: Only update when matching by existing UUID; reject duplicate SKU code with 409 Conflict
+        let product;
+        if (isUuid(id)) {
+          product = await tx.product.upsert({
+            where: { id },
+            update: {
+              name: cleanName,
+              code: cleanCode,
+              description: description ?? null,
+              isActive: isActive !== undefined ? Boolean(isActive) : true,
+              categoryId: cleanCategoryId,
+              ...stockFields,
+            },
+            create: {
+              id,
+              name: cleanName,
+              code: cleanCode,
+              description: description ?? null,
+              isActive: isActive !== undefined ? Boolean(isActive) : true,
+              categoryId: cleanCategoryId,
+              ...stockFields,
+            },
+          });
+        } else {
+          const duplicate = await tx.product.findUnique({ where: { code: cleanCode }, select: { id: true } });
+          if (duplicate) {
+            return { conflict: `Product with code "${cleanCode}" already exists.` as const };
+          }
+          product = await tx.product.create({
+            data: {
+              name: cleanName,
+              code: cleanCode,
+              description: description ?? null,
+              isActive: isActive !== undefined ? Boolean(isActive) : true,
+              categoryId: cleanCategoryId,
+              ...stockFields,
+            },
+          });
+        }
 
         if (Array.isArray(models)) {
           const existingModels = await tx.productModel.findMany({ where: { productId: product.id } });
@@ -333,14 +388,25 @@ catalogRouter.post('/products', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async
           });
         }
 
-        return tx.product.findUnique({
+        const loaded = await tx.product.findUnique({
           where: { id: product.id },
           include: { category: true, models: true, specificationKeys: { include: { options: true } } },
         });
+        return { product: loaded };
       },
       { timeout: 20000 }
     );
 
+    if ('conflict' in txResult && txResult.conflict) {
+      return res.status(409).json({ error: txResult.conflict });
+    }
+    const updatedProduct = txResult.product;
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'PRODUCT_SAVED',
+      entityType: 'Product',
+      entityId: updatedProduct?.id,
+      metadata: { code: updatedProduct?.code, name: updatedProduct?.name },
+    });
     res.json(formatProductForResponse(updatedProduct));
   } catch (error: any) {
     if (error?.code === 'P2002') {
@@ -357,6 +423,11 @@ catalogRouter.delete('/products/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DEL
       return res.status(400).json({ error: 'Invalid product ID format.' });
     }
     await prisma.product.delete({ where: { id } });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'PRODUCT_DELETED',
+      entityType: 'Product',
+      entityId: id,
+    });
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/products/:id');

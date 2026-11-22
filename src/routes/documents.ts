@@ -1,9 +1,11 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
-import { ROLE_GROUPS, requireRole } from '../auth';
+import { AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import { validateDocumentUpload } from '../security';
 import { isUuid, parsePagination, buildPrismaPaginationArgs, handleRouteError } from '../validation';
+import { recordAudit } from '../audit';
 import {
+  DOCUMENT_LIST_SELECT,
   persistDocumentPayload,
   resolveDocumentBinary,
   deleteStoredDocumentObject,
@@ -29,14 +31,28 @@ documentsRouter.get('/', async (req, res) => {
       where.projectId = req.query.projectId;
     }
 
-    const docs = await prisma.clientDocument.findMany({
-      where,
-      include: { customer: true },
-      orderBy: { createdAt: 'desc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+    // API-21: Exclude heavy fileUrl column at SQL level when includeData !== 'true'
+    const [docs, totalCount] = await Promise.all([
+      includeData
+        ? prisma.clientDocument.findMany({
+            where,
+            include: { customer: true },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            ...buildPrismaPaginationArgs(page.value),
+          })
+        : prisma.clientDocument.findMany({
+            where,
+            select: {
+              ...DOCUMENT_LIST_SELECT,
+              customer: true,
+            },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            ...buildPrismaPaginationArgs(page.value),
+          }),
+      page.value.isPaginated ? prisma.clientDocument.count({ where }) : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.clientDocument.count({ where })));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(docs.map((d) => formatDocumentForList(d, includeData)));
   } catch (error) {
@@ -159,54 +175,82 @@ documentsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (r
       validServiceId = srvExists.id;
     }
 
+    const existingDoc = isUuid(id)
+      ? await prisma.clientDocument.findUnique({ where: { id }, select: { fileUrl: true } })
+      : null;
+
     const persisted = await persistDocumentPayload(String(fileUrl || ''), fileName || title);
     const parsedSize =
       sizeBytes !== undefined && sizeBytes !== null && Number.isFinite(Number(sizeBytes))
         ? Math.max(0, Math.round(Number(sizeBytes)))
         : persisted.sizeBytes ?? null;
 
-    const doc = isUuid(id)
-      ? await prisma.clientDocument.upsert({
-          where: { id },
-          update: {
-            title: title || 'Документ',
-            fileType: fileType || 'application/pdf',
-            fileUrl: persisted.storedUrl,
-            fileName: fileName || null,
-            sizeBytes: parsedSize,
-            offerId: validOfferId,
-            projectId: validProjectId,
-            serviceId: validServiceId,
-          },
-          create: {
-            id,
-            customerId: validCustomerId,
-            offerId: validOfferId,
-            projectId: validProjectId,
-            serviceId: validServiceId,
-            title: title || 'Документ',
-            fileType: fileType || 'application/pdf',
-            fileUrl: persisted.storedUrl,
-            fileName: fileName || null,
-            sizeBytes: parsedSize,
-          },
-        })
-      : await prisma.clientDocument.create({
-          data: {
-            customerId: validCustomerId,
-            offerId: validOfferId,
-            projectId: validProjectId,
-            serviceId: validServiceId,
-            title: title || 'Документ',
-            fileType: fileType || 'application/pdf',
-            fileUrl: persisted.storedUrl,
-            fileName: fileName || null,
-            sizeBytes: parsedSize,
-          },
-        });
+    let doc;
+    try {
+      doc = isUuid(id)
+        ? await prisma.clientDocument.upsert({
+            where: { id },
+            update: {
+              customerId: validCustomerId,
+              title: title || 'Документ',
+              fileType: fileType || 'application/pdf',
+              fileUrl: persisted.storedUrl,
+              fileName: fileName || null,
+              sizeBytes: parsedSize,
+              offerId: validOfferId,
+              projectId: validProjectId,
+              serviceId: validServiceId,
+            },
+            create: {
+              id,
+              customerId: validCustomerId,
+              offerId: validOfferId,
+              projectId: validProjectId,
+              serviceId: validServiceId,
+              title: title || 'Документ',
+              fileType: fileType || 'application/pdf',
+              fileUrl: persisted.storedUrl,
+              fileName: fileName || null,
+              sizeBytes: parsedSize,
+            },
+          })
+        : await prisma.clientDocument.create({
+            data: {
+              customerId: validCustomerId,
+              offerId: validOfferId,
+              projectId: validProjectId,
+              serviceId: validServiceId,
+              title: title || 'Документ',
+              fileType: fileType || 'application/pdf',
+              fileUrl: persisted.storedUrl,
+              fileName: fileName || null,
+              sizeBytes: parsedSize,
+            },
+          });
+    } catch (dbErr) {
+      // API-20: Clean up newly uploaded storage object if DB write fails
+      if (isStorageRef(persisted.storedUrl)) {
+        await deleteStoredDocumentObject(persisted.storedUrl);
+      }
+      throw dbErr;
+    }
 
+    // API-20: Clean up replaced storage object after DB commit
+    if (existingDoc?.fileUrl && existingDoc.fileUrl !== persisted.storedUrl && isStorageRef(existingDoc.fileUrl)) {
+      void deleteStoredDocumentObject(existingDoc.fileUrl);
+    }
+
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'DOCUMENT_SAVED',
+      entityType: 'ClientDocument',
+      entityId: doc.id,
+      metadata: { title: doc.title, customerId: doc.customerId, projectId: doc.projectId },
+    });
+
+    // API-20: Never leak internal storage:// URI; return consistent format matching GET
     res.json({
       ...doc,
+      fileUrl: isStorageRef(doc.fileUrl) ? '' : doc.fileUrl,
       hasFile: Boolean(doc.fileUrl && doc.fileUrl !== '#'),
     });
   } catch (error) {
@@ -222,6 +266,11 @@ documentsRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), a
     }
     const deleted = await prisma.clientDocument.delete({ where: { id } });
     await deleteStoredDocumentObject(deleted.fileUrl);
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'DOCUMENT_DELETED',
+      entityType: 'ClientDocument',
+      entityId: id,
+    });
     res.json({ success: true, id });
   } catch (error) {
     return handleRouteError(res, error, 'DELETE /api/client-documents/:id');

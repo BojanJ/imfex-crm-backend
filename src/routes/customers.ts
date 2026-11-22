@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { formatOfferForResponse, formatTicketForResponse } from '../lib/formatters';
-import { ROLE_GROUPS, requireRole } from '../auth';
+import { AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import { isValidEmail } from '../security';
 import {
   isUuid,
@@ -11,6 +11,7 @@ import {
   buildPrismaPaginationArgs,
   handleRouteError,
 } from '../validation';
+import { recordAudit } from '../audit';
 
 export const customersRouter = Router();
 
@@ -19,18 +20,21 @@ customersRouter.get('/', async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const customers = await prisma.customer.findMany({
-      include: {
-        offers: true,
-        projects: true,
-        installedItems: true,
-        serviceTickets: true,
-      },
-      orderBy: { createdAt: 'desc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+    const [customers, totalCount] = await Promise.all([
+      prisma.customer.findMany({
+        include: {
+          offers: true,
+          projects: true,
+          installedItems: true,
+          serviceTickets: true,
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.customer.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.customer.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(
       customers.map((c) => ({
@@ -78,6 +82,12 @@ customersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (re
         })
       : await prisma.customer.create({ data });
 
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'CUSTOMER_SAVED',
+      entityType: 'Customer',
+      entityId: customer.id,
+      metadata: { name: customer.name, companyName: customer.companyName },
+    });
     res.json(customer);
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/customers');
@@ -91,6 +101,11 @@ customersRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), a
       return res.status(400).json({ error: 'Invalid customer ID format.' });
     }
     await prisma.customer.delete({ where: { id } });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'CUSTOMER_DELETED',
+      entityType: 'Customer',
+      entityId: id,
+    });
     res.json({ success: true, id });
   } catch (error: any) {
     if (error?.code === 'P2003') {

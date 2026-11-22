@@ -160,12 +160,34 @@ export async function deleteStoredDocumentObject(storedUrl: string): Promise<voi
   }
 }
 
+export const DOCUMENT_LIST_SELECT = {
+  id: true,
+  customerId: true,
+  offerId: true,
+  projectId: true,
+  serviceId: true,
+  title: true,
+  fileType: true,
+  fileName: true,
+  sizeBytes: true,
+  createdAt: true,
+} as const;
+
 /**
  * Strips heavy inline base64 blobs from document list responses unless `includeData` is true,
  * adding `hasFile` so the client knows it can fetch `/api/client-documents/:id` on demand.
+ * Also supports SQL-projected rows where `fileUrl` was omitted at query time (API-21).
  */
 export function formatDocumentForList(doc: any, includeData = false) {
   if (!doc) return doc;
+  if (doc.fileUrl === undefined) {
+    const hasFile = Boolean((typeof doc.sizeBytes === 'number' && doc.sizeBytes > 0) || doc.fileName);
+    return {
+      ...doc,
+      fileUrl: '',
+      hasFile,
+    };
+  }
   const rawUrl = typeof doc.fileUrl === 'string' ? doc.fileUrl : '';
   const hasFile = Boolean(rawUrl && rawUrl !== '#');
   if (includeData) {

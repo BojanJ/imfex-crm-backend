@@ -25,13 +25,16 @@ profilesRouter.get('/', async (req, res) => {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
-    const profiles = await prisma.profile.findMany({
-      select: SAFE_PROFILE_SELECT,
-      orderBy: { createdAt: 'asc' },
-      ...buildPrismaPaginationArgs(page.value),
-    });
+    const [profiles, totalCount] = await Promise.all([
+      prisma.profile.findMany({
+        select: SAFE_PROFILE_SELECT,
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        ...buildPrismaPaginationArgs(page.value),
+      }),
+      page.value.isPaginated ? prisma.profile.count() : Promise.resolve(0),
+    ]);
     if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(await prisma.profile.count()));
+      res.setHeader('X-Total-Count', String(totalCount));
     }
     res.json(profiles);
   } catch (error) {

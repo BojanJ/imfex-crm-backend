@@ -6,6 +6,7 @@ import {
   isUuid,
   SERVICE_PRIORITIES,
   SERVICE_STATUSES,
+  SERVICE_BILLING_TYPES,
   parseEnum,
   parseOptionalDate,
   parseFiniteNumber,
@@ -75,6 +76,9 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
       priority,
       status,
       laborHours,
+      billingType,
+      hourlyRate,
+      salesInvoiceId,
       solution,
       assignedTechnicianId,
       scheduledDate,
@@ -106,6 +110,21 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
     const hasLabor = laborHours !== undefined && laborHours !== null && laborHours !== '';
     const laborCheck = parseFiniteNumber(laborHours, 'laborHours', { min: 0, defaultVal: 0 });
     if (!laborCheck.ok) return res.status(400).json({ error: laborCheck.error });
+
+    const hasBillingType = billingType !== undefined && billingType !== null && billingType !== '';
+    const billingTypeCheck = parseEnum(billingType, SERVICE_BILLING_TYPES, 'billingType', 'WARRANTY');
+    if (!billingTypeCheck.ok) return res.status(400).json({ error: billingTypeCheck.error });
+
+    let parsedHourlyRate: number | null | undefined;
+    if (hourlyRate !== undefined) {
+      if (hourlyRate === null || hourlyRate === '') {
+        parsedHourlyRate = null;
+      } else {
+        const hrCheck = parseFiniteNumber(hourlyRate, 'hourlyRate', { min: 0, max: 10000 });
+        if (!hrCheck.ok) return res.status(400).json({ error: hrCheck.error });
+        parsedHourlyRate = hrCheck.value;
+      }
+    }
 
     const scheduledCheck = parseOptionalDate(scheduledDate, 'scheduledDate');
     if (!scheduledCheck.ok) return res.status(400).json({ error: scheduledCheck.error });
@@ -149,6 +168,11 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
             ? { defectDescription: String(defectDescription) }
             : {}),
           ...(hasLabor ? { laborHours: laborCheck.value } : {}),
+          ...(hasBillingType ? { billingType: billingTypeCheck.value } : {}),
+          ...(parsedHourlyRate !== undefined ? { hourlyRate: parsedHourlyRate } : {}),
+          ...(salesInvoiceId !== undefined
+            ? { salesInvoiceId: typeof salesInvoiceId === 'string' && salesInvoiceId.trim() ? salesInvoiceId.trim() : null }
+            : {}),
           ...(solution !== undefined ? { solution } : {}),
           ...(installedItemId !== undefined ? { installedItemId: validItem } : {}),
           ...(assignedTechnicianId !== undefined ? { assignedTechnicianId: validTech } : {}),
@@ -164,6 +188,9 @@ serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
           priority: priorityCheck.value,
           status: statusCheck.value,
           laborHours: laborCheck.value,
+          billingType: billingTypeCheck.value,
+          hourlyRate: parsedHourlyRate ?? undefined,
+          salesInvoiceId: typeof salesInvoiceId === 'string' && salesInvoiceId.trim() ? salesInvoiceId.trim() : null,
           solution,
           assignedTechnicianId: validTech,
           scheduledDate: scheduledCheck.value ?? undefined,
@@ -308,7 +335,18 @@ serviceRouter.get('/installed-items/:id', async (req, res) => {
 
 serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
-    const { id, customerId, projectId, productId, title, serialNumber, installationDate } = req.body ?? {};
+    const {
+      id,
+      customerId,
+      projectId,
+      productId,
+      title,
+      serialNumber,
+      installationDate,
+      warrantyMonths,
+      warrantyExpiresAt,
+      nextMaintenanceDate,
+    } = req.body ?? {};
     const cleanTitle = typeof title === 'string' ? title.trim() : '';
     if (!cleanTitle) {
       return res.status(400).json({ error: 'title is required.' });
@@ -341,6 +379,31 @@ serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
     const installDateCheck = parseOptionalDate(installationDate, 'installationDate');
     if (!installDateCheck.ok) return res.status(400).json({ error: installDateCheck.error });
 
+    const warrantyMonthsCheck = parseFiniteNumber(warrantyMonths, 'warrantyMonths', {
+      min: 0,
+      max: 240,
+      defaultVal: 24,
+      integer: true,
+    });
+    if (!warrantyMonthsCheck.ok) return res.status(400).json({ error: warrantyMonthsCheck.error });
+
+    const warrantyExpiresCheck = parseOptionalDate(warrantyExpiresAt, 'warrantyExpiresAt');
+    if (!warrantyExpiresCheck.ok) return res.status(400).json({ error: warrantyExpiresCheck.error });
+
+    const nextMaintCheck = parseOptionalDate(nextMaintenanceDate, 'nextMaintenanceDate');
+    if (!nextMaintCheck.ok) return res.status(400).json({ error: nextMaintCheck.error });
+
+    // BIZ-11: Auto-compute default warranty expiry (installationDate + warrantyMonths) & annual maintenance (+12m)
+    const baseInstall = installDateCheck.value ?? new Date();
+    const computedWarrantyExpiry =
+      warrantyExpiresCheck.value ??
+      (warrantyMonthsCheck.value > 0
+        ? new Date(baseInstall.getFullYear(), baseInstall.getMonth() + warrantyMonthsCheck.value, baseInstall.getDate())
+        : null);
+    const computedNextMaint =
+      nextMaintCheck.value ??
+      new Date(baseInstall.getFullYear() + 1, baseInstall.getMonth(), baseInstall.getDate());
+
     const item = isUuid(id)
       ? await prisma.installedItem.upsert({
           where: { id },
@@ -351,6 +414,9 @@ serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
             title: cleanTitle,
             serialNumber: serialNumber ?? null,
             installationDate: installDateCheck.value ?? undefined,
+            warrantyMonths: warrantyMonthsCheck.value,
+            warrantyExpiresAt: computedWarrantyExpiry,
+            nextMaintenanceDate: computedNextMaint,
           },
           create: {
             id,
@@ -359,7 +425,10 @@ serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
             productId: validProductId,
             title: cleanTitle,
             serialNumber: serialNumber ?? null,
-            installationDate: installDateCheck.value ?? undefined,
+            installationDate: baseInstall,
+            warrantyMonths: warrantyMonthsCheck.value,
+            warrantyExpiresAt: computedWarrantyExpiry,
+            nextMaintenanceDate: computedNextMaint,
           },
         })
       : await prisma.installedItem.create({
@@ -369,7 +438,10 @@ serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRI
             productId: validProductId,
             title: cleanTitle,
             serialNumber: serialNumber ?? null,
-            installationDate: installDateCheck.value ?? undefined,
+            installationDate: baseInstall,
+            warrantyMonths: warrantyMonthsCheck.value,
+            warrantyExpiresAt: computedWarrantyExpiry,
+            nextMaintenanceDate: computedNextMaint,
           },
         });
     void recordAudit(prisma, req as AuthenticatedRequest, {

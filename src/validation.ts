@@ -21,6 +21,7 @@ export const PROJECT_STATUSES = [
 ] as const;
 export const SERVICE_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] as const;
 export const SERVICE_STATUSES = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'COMPLETED', 'CLOSED'] as const;
+export const SERVICE_BILLING_TYPES = ['WARRANTY', 'BILLABLE', 'CONTRACT'] as const;
 export const PURCHASE_INVOICE_STATUSES = ['DRAFT', 'INVOICED', 'PARTIAL_PAID', 'PAID', 'CANCELLED'] as const;
 export const RECEIPT_STATUSES = ['PENDING', 'PARTIAL', 'RECEIVED'] as const;
 export const SALES_INVOICE_TYPES = ['PROFORMA', 'ADVANCE', 'FINAL', 'CREDIT_NOTE'] as const;

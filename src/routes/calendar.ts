@@ -55,8 +55,20 @@ calendarRouter.get('/:id', async (req, res) => {
 
 calendarRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
-    const { id, title, description, startDate, endDate, allDay, eventType, customerId, projectId, location, color } =
-      req.body ?? {};
+    const {
+      id,
+      title,
+      description,
+      startDate,
+      endDate,
+      allDay,
+      eventType,
+      customerId,
+      projectId,
+      assignedUserId,
+      location,
+      color,
+    } = req.body ?? {};
 
     const cleanTitle = typeof title === 'string' ? title.trim() : '';
     if (!cleanTitle) {
@@ -91,6 +103,14 @@ calendarRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
       validProjectId = projectId;
     }
 
+    let validAssignedUserId: string | null = null;
+    if (assignedUserId !== undefined && assignedUserId !== null && assignedUserId !== '') {
+      if (!isUuid(assignedUserId)) return res.status(400).json({ error: 'Invalid assignedUserId UUID format.' });
+      const userExists = await prisma.profile.findUnique({ where: { id: assignedUserId }, select: { id: true } });
+      if (!userExists) return res.status(404).json({ error: 'Referenced user not found.' });
+      validAssignedUserId = userExists.id;
+    }
+
     const data = {
       title: cleanTitle,
       description: description ?? null,
@@ -100,6 +120,7 @@ calendarRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (re
       eventType: eventTypeCheck.value,
       customerId: validCustomerId,
       projectId: validProjectId,
+      assignedUserId: validAssignedUserId,
       location: location ?? null,
       color: color ?? null,
     };

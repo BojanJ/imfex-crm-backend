@@ -128,6 +128,9 @@ export const formatTicketForResponse = (ticket: any) => {
   return {
     ...ticket,
     laborHours: Number(ticket.laborHours ?? 0),
+    billingType: ticket.billingType || 'WARRANTY',
+    hourlyRate: ticket.hourlyRate !== undefined && ticket.hourlyRate !== null ? Number(ticket.hourlyRate) : undefined,
+    salesInvoiceId: ticket.salesInvoiceId || undefined,
   };
 };
 

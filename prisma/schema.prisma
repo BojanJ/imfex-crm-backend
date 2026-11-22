@@ -310,10 +310,13 @@ model InstalledItem {
   project          Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
   productId        String?         @map("product_id") @db.Uuid
   product          Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
-  title            String
-  serialNumber     String?         @map("serial_number")
-  installationDate DateTime        @default(now()) @map("installation_date")
-  serviceTickets   ServiceTicket[]
+  title               String
+  serialNumber        String?         @map("serial_number")
+  installationDate    DateTime        @default(now()) @map("installation_date")
+  warrantyMonths      Int             @default(24) @map("warranty_months")
+  warrantyExpiresAt   DateTime?       @map("warranty_expires_at") @db.Date
+  nextMaintenanceDate DateTime?       @map("next_maintenance_date") @db.Date
+  serviceTickets      ServiceTicket[]
 
   @@index([customerId])
   @@index([projectId])
@@ -336,6 +339,9 @@ model ServiceTicket {
   scheduledDate        DateTime?       @map("scheduled_date")
   partsConsumed        Json?           @map("parts_consumed")
   laborHours           Decimal         @default(0.00) @map("labor_hours") @db.Decimal(5, 2)
+  billingType          String          @default("WARRANTY") @map("billing_type")
+  hourlyRate           Decimal?        @map("hourly_rate") @db.Decimal(10, 2)
+  salesInvoiceId       String?         @map("sales_invoice_id")
   solution             String?
   closedAt             DateTime?       @map("closed_at")
   createdAt            DateTime        @default(now()) @map("created_at")
@@ -380,10 +386,11 @@ model CalendarEvent {
   endDate     String?   @map("end_date")
   allDay      Boolean   @default(false) @map("all_day")
   eventType   String    @default("MEETING") @map("event_type")
-  customerId  String?   @map("customer_id") @db.Uuid
-  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  projectId   String?   @map("project_id")
-  location    String?
+  customerId     String?   @map("customer_id") @db.Uuid
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  projectId      String?   @map("project_id")
+  assignedUserId String?   @map("assigned_user_id") @db.Uuid
+  location       String?
   color       String?
   createdAt   DateTime  @default(now()) @map("created_at")
 

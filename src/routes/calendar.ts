@@ -36,6 +36,23 @@ calendarRouter.get('/', async (req, res) => {
   }
 });
 
+calendarRouter.get('/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid calendar event ID format.' });
+    }
+    const event = await prisma.calendarEvent.findUnique({
+      where: { id },
+      include: { customer: true },
+    });
+    if (!event) return res.status(404).json({ error: 'Calendar event not found.' });
+    res.json(event);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/calendar-events/:id');
+  }
+});
+
 calendarRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
     const { id, title, description, startDate, endDate, allDay, eventType, customerId, projectId, location, color } =

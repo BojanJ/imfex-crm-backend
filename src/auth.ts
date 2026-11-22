@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import type { PrismaClient, UserRole } from '@prisma/client';
+import { logger } from './logger';
 
 export const SAFE_PROFILE_SELECT = {
   id: true,
@@ -75,9 +76,9 @@ function getJwtSecret(): string {
 
   if (!cachedEphemeralSecret) {
     cachedEphemeralSecret = crypto.randomBytes(32).toString('hex');
-    console.warn(
-      '⚠️  JWT_SECRET is not set (or < 32 chars). Using an ephemeral development secret; sessions will reset on restart.'
-    );
+    logger.warn('jwt_ephemeral_secret', {
+      message: 'JWT_SECRET is not set (or < 32 chars). Using an ephemeral development secret; sessions will reset on restart.',
+    });
   }
 
   return cachedEphemeralSecret;
@@ -261,8 +262,8 @@ export function createRequireAuth(prisma: PrismaClient) {
       }
 
       return next();
-    } catch (error) {
-      console.error('Auth verification DB error:', error);
+    } catch (error: any) {
+      logger.error('auth_verification_db_error', { error: error?.message || String(error) });
       return res.status(500).json({ error: 'Authentication verification failed' });
     }
   };

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { logger } from './logger';
 
 const STORAGE_PREFIX = 'storage://';
 
@@ -79,9 +80,7 @@ export async function persistDocumentPayload(
     );
 
     if (!uploadRes.ok) {
-      console.warn(
-        `[storage] Supabase Storage upload returned ${uploadRes.status}; falling back to DB storage.`
-      );
+      logger.warn('storage_upload_fallback', { status: uploadRes.status });
       return { storedUrl: fileUrl, sizeBytes: parsed.buffer.length };
     }
 
@@ -89,8 +88,8 @@ export async function persistDocumentPayload(
       storedUrl: `${STORAGE_PREFIX}${cfg.bucket}/${objectPath}`,
       sizeBytes: parsed.buffer.length,
     };
-  } catch (err) {
-    console.warn('[storage] Supabase Storage network error; falling back to DB storage:', err);
+  } catch (err: any) {
+    logger.warn('storage_network_fallback', { error: err?.message || String(err) });
     return { storedUrl: fileUrl, sizeBytes: parsed.buffer.length };
   }
 }
@@ -155,8 +154,8 @@ export async function deleteStoredDocumentObject(storedUrl: string): Promise<voi
         },
       }
     );
-  } catch (err) {
-    console.warn('[storage] Failed to delete object from Supabase Storage:', err);
+  } catch (err: any) {
+    logger.warn('storage_delete_failed', { error: err?.message || String(err) });
   }
 }
 

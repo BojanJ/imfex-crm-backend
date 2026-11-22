@@ -95,6 +95,7 @@ adminRouter.post('/admin/reset-database', requireRole('SUPER_ADMIN'), async (req
         await tx.calendarEvent.deleteMany();
         await tx.serviceTicket.deleteMany();
         await tx.installedItem.deleteMany();
+        await tx.projectNote.deleteMany();
         await tx.project.deleteMany();
         await tx.offerItemSpecification.deleteMany();
         await tx.offerItem.deleteMany();
@@ -137,22 +138,41 @@ adminRouter.post('/admin/reset-database', requireRole('SUPER_ADMIN'), async (req
   }
 });
 
-// Audit Logs (IMP-07, SUPER_ADMIN only)
+// Audit Logs (IMP-07 / IMP-09, SUPER_ADMIN only — with filtering & pagination)
 adminRouter.get('/audit-logs', requireRole('SUPER_ADMIN'), async (req, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>, 200);
     if (!page.ok) return res.status(400).json({ error: page.error });
 
+    const actionFilter = typeof req.query.action === 'string' ? req.query.action.trim() : '';
+    const entityTypeFilter = typeof req.query.entityType === 'string' ? req.query.entityType.trim() : '';
+    const searchFilter = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+
+    const where: Record<string, unknown> = {};
+    if (actionFilter && actionFilter !== 'ALL') {
+      where.action = actionFilter;
+    }
+    if (entityTypeFilter && entityTypeFilter !== 'ALL') {
+      where.entityType = entityTypeFilter;
+    }
+    if (searchFilter) {
+      where.OR = [
+        { actorEmail: { contains: searchFilter, mode: 'insensitive' } },
+        { action: { contains: searchFilter, mode: 'insensitive' } },
+        { entityType: { contains: searchFilter, mode: 'insensitive' } },
+        { entityId: { contains: searchFilter, mode: 'insensitive' } },
+      ];
+    }
+
     const [logs, totalCount] = await Promise.all([
       prisma.auditLog.findMany({
+        where,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         ...(page.value.isPaginated ? buildPrismaPaginationArgs(page.value) : { take: 100 }),
       }),
-      page.value.isPaginated ? prisma.auditLog.count() : Promise.resolve(0),
+      prisma.auditLog.count({ where }),
     ]);
-    if (page.value.isPaginated) {
-      res.setHeader('X-Total-Count', String(totalCount));
-    }
+    res.setHeader('X-Total-Count', String(totalCount));
     res.json(logs);
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/audit-logs');

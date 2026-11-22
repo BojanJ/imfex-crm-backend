@@ -138,6 +138,17 @@ financeRouter.get('/purchase-invoices', requireRole(...ROLE_GROUPS.FINANCE_READ)
   }
 });
 
+financeRouter.get('/purchase-invoices/:id', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const row = await prisma.purchaseInvoice.findUnique({ where: { id } });
+    if (!row) return res.status(404).json({ error: 'Purchase invoice not found.' });
+    res.json(formatPurchaseInvoice(row));
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/purchase-invoices/:id');
+  }
+});
+
 financeRouter.post('/purchase-invoices', requireRole(...ROLE_GROUPS.FINANCE_WRITE), async (req, res) => {
   try {
     const b = req.body ?? {};
@@ -248,6 +259,18 @@ financeRouter.get('/sales-invoices', requireRole(...ROLE_GROUPS.FINANCE_READ), a
     res.json(enriched);
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/sales-invoices');
+  }
+});
+
+financeRouter.get('/sales-invoices/:id', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const row = await prisma.salesInvoice.findUnique({ where: { id } });
+    if (!row) return res.status(404).json({ error: 'Sales invoice not found.' });
+    const [enriched] = await attachCustomersToRows([formatSalesInvoice(row)]);
+    res.json(enriched);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/sales-invoices/:id');
   }
 });
 
@@ -402,6 +425,20 @@ financeRouter.get('/dispatch-notes', async (req, res) => {
   }
 });
 
+financeRouter.get('/dispatch-notes/:id', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const row = await prisma.dispatchNote.findUnique({ where: { id } });
+    if (!row) return res.status(404).json({ error: 'Dispatch note not found.' });
+    const [enriched] = await attachCustomersToRows([
+      { ...row, items: Array.isArray(row.items) ? row.items : [] },
+    ]);
+    res.json(enriched);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/dispatch-notes/:id');
+  }
+});
+
 financeRouter.post('/dispatch-notes', requireRole(...ROLE_GROUPS.FINANCE_SALES_WRITE), async (req, res) => {
   try {
     const b = req.body ?? {};
@@ -547,6 +584,17 @@ financeRouter.get('/payments', requireRole(...ROLE_GROUPS.FINANCE_READ), async (
     res.json(rows.map(formatPaymentRecord));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/payments');
+  }
+});
+
+financeRouter.get('/payments/:id', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const row = await prisma.paymentRecord.findUnique({ where: { id } });
+    if (!row) return res.status(404).json({ error: 'Payment record not found.' });
+    res.json(formatPaymentRecord(row));
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/payments/:id');
   }
 });
 

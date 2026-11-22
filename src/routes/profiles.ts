@@ -42,6 +42,23 @@ profilesRouter.get('/', async (req, res) => {
   }
 });
 
+profilesRouter.get('/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid profile ID format.' });
+    }
+    const profile = await prisma.profile.findUnique({
+      where: { id },
+      select: SAFE_PROFILE_SELECT,
+    });
+    if (!profile) return res.status(404).json({ error: 'Profile not found.' });
+    res.json(profile);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/profiles/:id');
+  }
+});
+
 profilesRouter.post('/', requireRole('SUPER_ADMIN'), async (req, res) => {
   try {
     const { email, fullName, role, password } = req.body ?? {};

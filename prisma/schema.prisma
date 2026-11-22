@@ -104,7 +104,7 @@ model Product {
   stockType         String             @default("STOCK") @map("stock_type")
   stockQuantity     Int                @default(0) @map("stock_quantity")
   reservedQuantity  Int                @default(0) @map("reserved_quantity")
-  purchasePrice     Decimal            @default(0.00) @map("purchase_price") @db.Decimal(10, 2)
+  purchasePrice     Decimal            @default(0.00) @map("purchase_price") @db.Decimal(12, 2)
   createdAt         DateTime           @default(now()) @map("created_at")
   models            ProductModel[]
   specificationKeys SpecificationKey[]
@@ -121,7 +121,7 @@ model ProductModel {
   productId  String      @map("product_id") @db.Uuid
   product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
   name       String
-  basePrice  Decimal     @default(0.00) @map("base_price") @db.Decimal(10, 2)
+  basePrice  Decimal     @default(0.00) @map("base_price") @db.Decimal(12, 2)
   createdAt  DateTime    @default(now()) @map("created_at")
   offerItems OfferItem[]
 
@@ -149,7 +149,7 @@ model SpecificationOption {
   specificationKeyId      String                   @map("specification_key_id") @db.Uuid
   specificationKey        SpecificationKey         @relation(fields: [specificationKeyId], references: [id], onDelete: Cascade)
   label                   String
-  priceModifier           Decimal                  @default(0.00) @map("price_modifier") @db.Decimal(10, 2)
+  priceModifier           Decimal                  @default(0.00) @map("price_modifier") @db.Decimal(12, 2)
   isDefault               Boolean                  @default(false) @map("is_default")
   createdAt               DateTime                 @default(now()) @map("created_at")
   offerItemSpecifications OfferItemSpecification[]
@@ -190,10 +190,10 @@ model Offer {
   status          OfferStatus @default(DRAFT)
   taxRate         Decimal     @default(18.00) @map("tax_rate") @db.Decimal(5, 2)
   discountRate    Decimal     @default(0.00) @map("discount_rate") @db.Decimal(5, 2)
-  discountAmount  Decimal     @default(0.00) @map("discount_amount") @db.Decimal(10, 2)
-  subtotal        Decimal     @default(0.00) @db.Decimal(10, 2)
-  taxAmount       Decimal     @default(0.00) @map("tax_amount") @db.Decimal(10, 2)
-  totalAmount     Decimal     @default(0.00) @map("total_amount") @db.Decimal(10, 2)
+  discountAmount  Decimal     @default(0.00) @map("discount_amount") @db.Decimal(12, 2)
+  subtotal        Decimal     @default(0.00) @db.Decimal(12, 2)
+  taxAmount       Decimal     @default(0.00) @map("tax_amount") @db.Decimal(12, 2)
+  totalAmount     Decimal     @default(0.00) @map("total_amount") @db.Decimal(12, 2)
   validUntil      DateTime?   @map("valid_until") @db.Date
   createdAt       DateTime    @default(now()) @map("created_at")
   items           OfferItem[]
@@ -219,8 +219,8 @@ model OfferItem {
   widthMm                 Int?                     @map("width_mm")
   heightMm                Int?                     @map("height_mm")
   quantity                Int                      @default(1)
-  unitPrice               Decimal                  @default(0.00) @map("unit_price") @db.Decimal(10, 2)
-  totalPrice              Decimal                  @default(0.00) @map("total_price") @db.Decimal(10, 2)
+  unitPrice               Decimal                  @default(0.00) @map("unit_price") @db.Decimal(12, 2)
+  totalPrice              Decimal                  @default(0.00) @map("total_price") @db.Decimal(12, 2)
   createdAt               DateTime                 @default(now()) @map("created_at")
   offerItemSpecifications OfferItemSpecification[]
 
@@ -239,7 +239,7 @@ model OfferItemSpecification {
   specificationOption   SpecificationOption? @relation(fields: [specificationOptionId], references: [id], onDelete: SetNull)
   customValue           String?              @map("custom_value")
   customKeyName         String?              @map("custom_key_name")
-  customPriceModifier   Decimal?             @default(0.00) @map("custom_price_modifier") @db.Decimal(10, 2)
+  customPriceModifier   Decimal?             @default(0.00) @map("custom_price_modifier") @db.Decimal(12, 2)
   createdAt             DateTime             @default(now()) @map("created_at")
 
   @@index([offerItemId])
@@ -273,11 +273,25 @@ model Project {
   createdAt            DateTime      @default(now()) @map("created_at")
   documents            ClientDocument[]
   installedItems       InstalledItem[]
+  notes                ProjectNote[]
 
   @@index([customerId])
   @@index([status])
   @@index([responsibleUserId])
   @@map("projects")
+}
+
+model ProjectNote {
+  id         String   @id @default(uuid()) @db.Uuid
+  projectId  String   @map("project_id") @db.Uuid
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  authorId   String?  @map("author_id") @db.Uuid
+  authorName String   @map("author_name")
+  content    String
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([projectId, createdAt])
+  @@map("project_notes")
 }
 
 model InstalledItem {

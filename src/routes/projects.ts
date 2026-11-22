@@ -263,3 +263,91 @@ projectsRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), as
     return handleRouteError(res, error, 'DELETE /api/projects/:id');
   }
 });
+
+// Project Internal Notes / Comments Timeline (IMP-10)
+projectsRouter.get('/:id/notes', async (req, res) => {
+  try {
+    const projectId = String(req.params.id);
+    if (!isUuid(projectId)) {
+      return res.status(400).json({ error: 'Invalid project ID format.' });
+    }
+    const exists = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
+    if (!exists) return res.status(404).json({ error: 'Project not found.' });
+
+    const notes = await prisma.projectNote.findMany({
+      where: { projectId },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 200,
+    });
+    res.json(notes);
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/projects/:id/notes');
+  }
+});
+
+projectsRouter.post('/:id/notes', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req: AuthenticatedRequest, res) => {
+  try {
+    const projectId = String(req.params.id);
+    if (!isUuid(projectId)) {
+      return res.status(400).json({ error: 'Invalid project ID format.' });
+    }
+    const rawContent = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!rawContent) {
+      return res.status(400).json({ error: 'Note content is required.' });
+    }
+    if (rawContent.length > 2000) {
+      return res.status(400).json({ error: 'Note content must be at most 2000 characters.' });
+    }
+
+    const exists = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true, projectNumber: true } });
+    if (!exists) return res.status(404).json({ error: 'Project not found.' });
+
+    const authorName = req.user?.fullName || req.user?.email || 'Team Member';
+    const note = await prisma.projectNote.create({
+      data: {
+        projectId,
+        authorId: req.user?.id ?? null,
+        authorName,
+        content: rawContent,
+      },
+    });
+    void recordAudit(prisma, req, {
+      action: 'PROJECT_NOTE_ADDED',
+      entityType: 'Project',
+      entityId: projectId,
+      metadata: { noteId: note.id, projectNumber: exists.projectNumber },
+    });
+    res.status(201).json(note);
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/projects/:id/notes');
+  }
+});
+
+projectsRouter.delete('/:id/notes/:noteId', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req: AuthenticatedRequest, res) => {
+  try {
+    const projectId = String(req.params.id);
+    const noteId = String(req.params.noteId);
+    if (!isUuid(projectId) || !isUuid(noteId)) {
+      return res.status(400).json({ error: 'Invalid project or note ID format.' });
+    }
+    const existing = await prisma.projectNote.findFirst({ where: { id: noteId, projectId } });
+    if (!existing) return res.status(404).json({ error: 'Project note not found.' });
+
+    const isSuperAdmin = req.user?.role === 'SUPER_ADMIN';
+    const isAuthor = existing.authorId && req.user?.id === existing.authorId;
+    if (!isSuperAdmin && !isAuthor) {
+      return res.status(403).json({ error: 'You can only delete your own project notes.' });
+    }
+
+    await prisma.projectNote.delete({ where: { id: noteId } });
+    void recordAudit(prisma, req, {
+      action: 'PROJECT_NOTE_DELETED',
+      entityType: 'Project',
+      entityId: projectId,
+      metadata: { noteId },
+    });
+    res.json({ success: true, id: noteId });
+  } catch (error) {
+    return handleRouteError(res, error, 'DELETE /api/projects/:id/notes/:noteId');
+  }
+});

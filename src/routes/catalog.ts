@@ -145,6 +145,31 @@ catalogRouter.get('/products', async (req, res) => {
   }
 });
 
+catalogRouter.get('/products/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid product ID format.' });
+    }
+    const product = await prisma.product.findUnique({
+      where: { id },
+      include: {
+        category: true,
+        models: true,
+        specificationKeys: {
+          include: {
+            options: true,
+          },
+        },
+      },
+    });
+    if (!product) return res.status(404).json({ error: 'Product not found.' });
+    res.json(formatProductForResponse(product));
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/products/:id');
+  }
+});
+
 catalogRouter.post('/products', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async (req, res) => {
   try {
     const {

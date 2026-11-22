@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
-import { formatProductForResponse, formatTicketForResponse } from '../lib/formatters';
+import { formatProductForResponse, formatProjectForResponse, formatTicketForResponse } from '../lib/formatters';
 import { SAFE_PROFILE_SELECT, AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import {
   isUuid,
@@ -216,11 +216,33 @@ serviceRouter.get('/installed-items', async (req, res) => {
     res.json(
       items.map((it) => ({
         ...it,
+        project: it.project ? formatProjectForResponse(it.project) : it.project,
         product: it.product ? formatProductForResponse(it.product) : it.product,
       }))
     );
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/installed-items');
+  }
+});
+
+serviceRouter.get('/installed-items/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid installed item ID format.' });
+    }
+    const item = await prisma.installedItem.findUnique({
+      where: { id },
+      include: { customer: true, project: true, product: true },
+    });
+    if (!item) return res.status(404).json({ error: 'Installed item not found.' });
+    res.json({
+      ...item,
+      project: item.project ? formatProjectForResponse(item.project) : item.project,
+      product: item.product ? formatProductForResponse(item.product) : item.product,
+    });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/installed-items/:id');
   }
 });
 

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
-import { formatOfferForResponse, formatTicketForResponse } from '../lib/formatters';
+import { formatOfferForResponse, formatProjectForResponse, formatTicketForResponse } from '../lib/formatters';
 import { AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import { isValidEmail } from '../security';
 import {
@@ -40,11 +40,39 @@ customersRouter.get('/', async (req, res) => {
       customers.map((c) => ({
         ...c,
         offers: (c.offers || []).map(formatOfferForResponse),
+        projects: (c.projects || []).map((p) => formatProjectForResponse(p)),
         serviceTickets: (c.serviceTickets || []).map(formatTicketForResponse),
       }))
     );
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/customers');
+  }
+});
+
+customersRouter.get('/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!isUuid(id)) {
+      return res.status(400).json({ error: 'Invalid customer ID format.' });
+    }
+    const customer = await prisma.customer.findUnique({
+      where: { id },
+      include: {
+        offers: true,
+        projects: true,
+        installedItems: true,
+        serviceTickets: true,
+      },
+    });
+    if (!customer) return res.status(404).json({ error: 'Customer not found.' });
+    res.json({
+      ...customer,
+      offers: (customer.offers || []).map(formatOfferForResponse),
+      projects: (customer.projects || []).map((p) => formatProjectForResponse(p)),
+      serviceTickets: (customer.serviceTickets || []).map(formatTicketForResponse),
+    });
+  } catch (error) {
+    return handleRouteError(res, error, 'GET /api/customers/:id');
   }
 });
 

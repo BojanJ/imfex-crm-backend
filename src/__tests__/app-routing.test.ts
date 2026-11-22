@@ -1,9 +1,16 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createApp } from '../app';
 import { buildPooledDatabaseUrl } from '../lib/prisma';
-import { formatOfferForResponse, formatProductForResponse, formatSalesInvoice } from '../lib/formatters';
+import {
+  formatOfferForResponse,
+  formatProductForResponse,
+  formatProjectForResponse,
+  formatSalesInvoice,
+} from '../lib/formatters';
 
 describe('Modular Express App & Routing (IMP-01)', () => {
   let server: Server;
@@ -140,5 +147,89 @@ describe('Modular Express App & Routing (IMP-01)', () => {
     const inv = formatSalesInvoice({ id: 's1', totalAmount: '250.5', paidAmount: '100' });
     expect(inv.totalAmount).toBe(250.5);
     expect(inv.paidAmount).toBe(100);
+  });
+
+  it('enforces authentication on all single-entity GET /:id and project notes routes (IMP-10, IMP-11)', async () => {
+    const sampleId = '00000000-0000-4000-8000-000000000001';
+    const singleEndpoints = [
+      `/api/customers/${sampleId}`,
+      `/api/products/${sampleId}`,
+      `/api/calendar-events/${sampleId}`,
+      `/api/profiles/${sampleId}`,
+      `/api/installed-items/${sampleId}`,
+      `/api/purchase-invoices/${sampleId}`,
+      `/api/sales-invoices/${sampleId}`,
+      `/api/dispatch-notes/${sampleId}`,
+      `/api/payments/${sampleId}`,
+      `/api/projects/${sampleId}/notes`,
+      `/api/audit-logs?limit=25&offset=0&entityType=Project&search=test`,
+    ];
+
+    const responses = await Promise.all(singleEndpoints.map((p) => fetch(`${baseUrl}${p}`)));
+    for (const res of responses) {
+      expect(res.status).toBe(401);
+    }
+
+    const postNoteRes = await fetch(`${baseUrl}/api/projects/${sampleId}/notes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Site ready' }),
+    });
+    expect(postNoteRes.status).toBe(401);
+
+    const delNoteRes = await fetch(`${baseUrl}/api/projects/${sampleId}/notes/${sampleId}`, {
+      method: 'DELETE',
+    });
+    expect(delNoteRes.status).toBe(401);
+  });
+
+  it('flattens project workflowData and strips document base64 payloads by default (IMP-11)', () => {
+    const formatted = formatProjectForResponse({
+      id: 'proj-1',
+      title: 'Gate Install',
+      workflowData: { advancePaid: true, supplierOrdered: true, selectedMotorId: 'm-1' },
+      offer: { id: 'o-1', totalAmount: '1250.50' },
+      documents: [{ id: 'd-1', fileName: 'plan.pdf', fileType: 'application/pdf', fileUrl: 'data:application/pdf;base64,AAAA' }],
+    });
+
+    expect(formatted.advancePaid).toBe(true);
+    expect(formatted.supplierOrdered).toBe(true);
+    expect(formatted.selectedMotorId).toBe('m-1');
+    expect(formatted.offer.totalAmount).toBe(1250.5);
+    expect(formatted.documents[0].fileUrl).toBe('');
+    expect(formatted.documents[0].hasFile).toBe(true);
+
+    const withData = formatProjectForResponse(
+      {
+        id: 'proj-1',
+        documents: [{ id: 'd-1', fileName: 'plan.pdf', fileType: 'application/pdf', fileUrl: 'data:application/pdf;base64,AAAA' }],
+      },
+      true
+    );
+    expect(withData.documents[0].fileUrl).toBe('data:application/pdf;base64,AAAA');
+    expect(withData.documents[0].hasFile).toBe(true);
+  });
+
+  it('uses structured logger instead of raw console calls across backend runtime source (IMP-11)', () => {
+    const srcRoot = path.resolve(__dirname, '..');
+    const offenders: string[] = [];
+
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === '__tests__') continue;
+          walk(fullPath);
+        } else if (entry.name.endsWith('.ts') && entry.name !== 'logger.ts') {
+          const content = fs.readFileSync(fullPath, 'utf8');
+          if (/\bconsole\.(log|warn|error)\s*\(/.test(content)) {
+            offenders.push(path.relative(srcRoot, fullPath));
+          }
+        }
+      }
+    };
+
+    walk(srcRoot);
+    expect(offenders).toEqual([]);
   });
 });

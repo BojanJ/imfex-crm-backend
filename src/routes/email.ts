@@ -25,7 +25,7 @@ emailRouter.post('/send-offer', requireRole(...ROLE_GROUPS.EMAIL_OFFER), emailLi
 
     if (!resend) {
       return res.status(503).json({
-        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables in Render.',
+        error: 'Email service is not configured. Please set RESEND_API_KEY in the server environment.',
       });
     }
 
@@ -42,7 +42,14 @@ emailRouter.post('/send-offer', requireRole(...ROLE_GROUPS.EMAIL_OFFER), emailLi
     const safeOfferNumber = escapeHtml(offerNumber || '');
     const safeCustomerName = escapeHtml(customerName || 'Клиент');
     const safeCustomMessage = customMessage ? escapeHtml(customMessage) : '';
-    const safeAmount = Number.isFinite(Number(totalAmount)) ? Number(totalAmount).toFixed(2) : '0.00';
+    const hasOfferAmount =
+      totalAmount !== null &&
+      totalAmount !== undefined &&
+      String(totalAmount).trim() !== '' &&
+      Number.isFinite(Number(totalAmount));
+    const offerAmountPhrase = hasOfferAmount
+      ? ` со вкупен износ од <strong>€${Number(totalAmount).toFixed(2)}</strong>`
+      : '';
     const cleanFilename = String(offerNumber || 'Offer').replace(/[^a-zA-Z0-9_-]/g, '_');
 
     let attachments: { filename: string; content: Buffer }[] = [];
@@ -72,7 +79,7 @@ emailRouter.post('/send-offer', requireRole(...ROLE_GROUPS.EMAIL_OFFER), emailLi
         <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px; background-color: #ffffff;">
           <p style="font-size: 14px; font-weight: 700; color: #0f172a;">Почитувани ${safeCustomerName},</p>
           <p style="font-size: 13px; color: #334155;">
-            Во прилог на оваа порака Ви ја испраќаме официјалната комерцијална понуда <strong>${safeOfferNumber}</strong> со вкупен износ од <strong>€${safeAmount}</strong>.
+            Во прилог на оваа порака Ви ја испраќаме официјалната комерцијална понуда <strong>${safeOfferNumber}</strong>${offerAmountPhrase}.
           </p>
 
           ${
@@ -104,7 +111,8 @@ emailRouter.post('/send-offer', requireRole(...ROLE_GROUPS.EMAIL_OFFER), emailLi
     });
 
     if (result.error) {
-      return res.status(400).json({ error: result.error.message });
+      logger.error('resend_offer_upstream_error', { error: result.error.message });
+      return res.status(502).json({ error: 'Upstream email provider rejected the request.' });
     }
 
     void recordAudit(prisma, req as AuthenticatedRequest, {
@@ -140,7 +148,7 @@ emailRouter.post('/send-invoice', requireRole(...ROLE_GROUPS.EMAIL_INVOICE), ema
 
     if (!resend) {
       return res.status(503).json({
-        error: 'Email service is not configured. Please add RESEND_API_KEY to environment variables in Render.',
+        error: 'Email service is not configured. Please set RESEND_API_KEY in the server environment.',
       });
     }
 
@@ -170,8 +178,22 @@ emailRouter.post('/send-invoice', requireRole(...ROLE_GROUPS.EMAIL_INVOICE), ema
     const safeInvoiceNumber = escapeHtml(invoiceNumber || '');
     const safeCustomerName = escapeHtml(customerName || 'Клиент');
     const safeCustomMessage = customMessage ? escapeHtml(customMessage) : '';
-    const safeDueDate = dueDate ? escapeHtml(String(dueDate)) : '';
-    const hasAmount = normalizedType !== 'DISPATCH' && Number.isFinite(Number(totalAmount));
+    const formatDateDDMMYYYY = (raw: unknown): string => {
+      if (!raw) return '';
+      const str = String(raw).trim();
+      const iso = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+      if (iso) return `${iso[3].padStart(2, '0')}/${iso[2].padStart(2, '0')}/${iso[1]}`;
+      const dot = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+      if (dot) return `${dot[1].padStart(2, '0')}/${dot[2].padStart(2, '0')}/${dot[3]}`;
+      return str;
+    };
+    const safeDueDate = dueDate ? escapeHtml(formatDateDDMMYYYY(dueDate)) : '';
+    const hasAmount =
+      normalizedType !== 'DISPATCH' &&
+      totalAmount !== null &&
+      totalAmount !== undefined &&
+      String(totalAmount).trim() !== '' &&
+      Number.isFinite(Number(totalAmount));
     const safeAmount = hasAmount ? Number(totalAmount).toFixed(2) : '';
     const cleanFilename = String(invoiceNumber || 'Invoice').replace(/[^a-zA-Z0-9_-]/g, '_');
 
@@ -248,7 +270,8 @@ emailRouter.post('/send-invoice', requireRole(...ROLE_GROUPS.EMAIL_INVOICE), ema
     });
 
     if (result.error) {
-      return res.status(400).json({ error: result.error.message });
+      logger.error('resend_offer_upstream_error', { error: result.error.message });
+      return res.status(502).json({ error: 'Upstream email provider rejected the request.' });
     }
 
     void recordAudit(prisma, req as AuthenticatedRequest, {

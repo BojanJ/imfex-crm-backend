@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
+import { ROLE_GROUPS, requireRole } from '../auth';
 import {
   isUuid,
   parseIsoDateString,
@@ -29,7 +30,7 @@ calendarRouter.get('/', async (req, res) => {
   }
 });
 
-calendarRouter.post('/', async (req, res) => {
+calendarRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
     const { id, title, description, startDate, endDate, allDay, eventType, customerId, projectId, location, color } =
       req.body ?? {};
@@ -85,7 +86,7 @@ calendarRouter.post('/', async (req, res) => {
   }
 });
 
-calendarRouter.delete('/:id', async (req, res) => {
+calendarRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

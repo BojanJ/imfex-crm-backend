@@ -20,10 +20,9 @@ export function isValidEmail(email: unknown): boolean {
 
 export function generateSecureTempPassword(length = 12): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%';
-  const bytes = crypto.randomBytes(length);
   let out = '';
   for (let i = 0; i < length; i++) {
-    out += alphabet[bytes[i] % alphabet.length];
+    out += alphabet[crypto.randomInt(0, alphabet.length)];
   }
   return out;
 }
@@ -50,30 +49,37 @@ export function createRateLimiter(options: {
   max: number;
   keyPrefix: string;
   message?: string;
+  maxBuckets?: number;
 }) {
   const buckets = new Map<string, RateLimitBucket>();
+  const maxBuckets = options.maxBuckets ?? 5000;
+  let lastSweepAt = 0;
 
   return function rateLimiter(req: Request, res: Response, next: NextFunction) {
     const now = Date.now();
-    // Opportunistic cleanup to keep memory bounded
-    if (buckets.size > 5000) {
+
+    // Periodic expired-bucket sweep (at most once per window) + O(1) oldest eviction when full (SEC-13)
+    if (buckets.size >= maxBuckets && now - lastSweepAt >= Math.min(options.windowMs, 60_000)) {
+      lastSweepAt = now;
       for (const [k, v] of buckets.entries()) {
         if (v.resetAt <= now) buckets.delete(k);
       }
     }
 
-    const ip =
-      (typeof req.headers['x-forwarded-for'] === 'string'
-        ? req.headers['x-forwarded-for'].split(',')[0].trim()
-        : '') ||
-      req.ip ||
-      req.socket.remoteAddress ||
-      'unknown';
-
+    // Rely on Express req.ip (respecting `trust proxy`) instead of spoofable leftmost X-Forwarded-For
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
     const key = `${options.keyPrefix}:${ip}`;
     const current = buckets.get(key);
 
     if (!current || current.resetAt <= now) {
+      if (current) {
+        buckets.delete(key);
+      } else if (buckets.size >= maxBuckets) {
+        const oldestKey = buckets.keys().next().value;
+        if (oldestKey !== undefined) {
+          buckets.delete(oldestKey);
+        }
+      }
       buckets.set(key, { count: 1, resetAt: now + options.windowMs });
       return next();
     }
@@ -99,21 +105,27 @@ export function buildCorsOptions(): CorsOptions {
     .map((o) => o.trim().replace(/\/$/, ''))
     .filter(Boolean);
 
+  const devOrigins =
+    process.env.NODE_ENV === 'production'
+      ? []
+      : ['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000'];
+
   const staticAllowed = new Set<string>([
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'http://127.0.0.1:3000',
+    ...devOrigins,
+    'https://imfex-crm-frontend.vercel.app',
     ...envOrigins,
   ]);
 
-  const vercelPreviewPattern = /^https:\/\/imfex-crm-frontend(?:-[a-z0-9-]+)?\.vercel\.app$/i;
+  // Only allow scoped Vercel preview deployments if explicitly enabled via env
+  const allowVercelPreviews = process.env.ALLOW_VERCEL_PREVIEWS === 'true';
+  const vercelPreviewPattern = /^https:\/\/imfex-crm-frontend-[a-z0-9-]+\.vercel\.app$/i;
 
   return {
     origin(origin, callback) {
       // Allow same-origin / server-to-server / curl requests without an Origin header
       if (!origin) return callback(null, true);
       const normalized = origin.replace(/\/$/, '');
-      if (staticAllowed.has(normalized) || vercelPreviewPattern.test(normalized)) {
+      if (staticAllowed.has(normalized) || (allowVercelPreviews && vercelPreviewPattern.test(normalized))) {
         return callback(null, true);
       }
       return callback(new Error(`Origin ${origin} not allowed by CORS`));
@@ -206,6 +218,66 @@ export function validateDocumentUpload(
   } else if (mime === 'image/webp') {
     if (headBuf.subarray(0, 4).toString('ascii') !== 'RIFF' || headBuf.subarray(8, 12).toString('ascii') !== 'WEBP') {
       return { ok: false, error: 'Invalid WEBP file header.' };
+    }
+  }
+
+  return { ok: true };
+}
+
+const SAFE_SIGNATURE_MIMES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp']);
+const MAX_SIGNATURE_DATA_URL_LENGTH = 2 * 1024 * 1024; // 2 MB
+
+export function validateSignatureUrl(
+  signatureUrl: unknown
+): { ok: true } | { ok: false; error: string } {
+  if (signatureUrl === undefined || signatureUrl === null || signatureUrl === '') {
+    return { ok: true };
+  }
+  if (typeof signatureUrl !== 'string') {
+    return { ok: false, error: 'Invalid signatureUrl value.' };
+  }
+
+  const trimmed = signatureUrl.trim();
+  if (!trimmed) return { ok: true };
+
+  if (trimmed.length > MAX_SIGNATURE_DATA_URL_LENGTH) {
+    return { ok: false, error: 'Signature payload exceeds maximum allowed size.' };
+  }
+
+  if (trimmed.startsWith('storage://')) {
+    return { ok: true };
+  }
+
+  if (/^(javascript|vbscript):/i.test(trimmed) || !trimmed.startsWith('data:')) {
+    return { ok: false, error: 'Signature must be a safe raster image data URI (PNG, JPEG, or WEBP).' };
+  }
+
+  const match = trimmed.match(/^data:([^;]+);base64,([A-Za-z0-9+/=\s]+)$/);
+  if (!match) {
+    return { ok: false, error: 'Malformed base64 signature data URI.' };
+  }
+
+  const mime = match[1].toLowerCase().trim();
+  const base64Body = match[2].replace(/\s+/g, '');
+  if (!SAFE_SIGNATURE_MIMES.has(mime)) {
+    return { ok: false, error: `Unsupported or unsafe signature MIME type: ${mime}` };
+  }
+
+  const headBuf = Buffer.from(base64Body.slice(0, 32), 'base64');
+  if (mime === 'image/png') {
+    if (!headBuf.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]))) {
+      return { ok: false, error: 'Invalid PNG signature header.' };
+    }
+  } else if (mime === 'image/jpeg' || mime === 'image/jpg') {
+    if (!(headBuf[0] === 0xff && headBuf[1] === 0xd8 && headBuf[2] === 0xff)) {
+      return { ok: false, error: 'Invalid JPEG signature header.' };
+    }
+  } else if (mime === 'image/webp') {
+    if (
+      headBuf.subarray(0, 4).toString('ascii') !== 'RIFF' ||
+      headBuf.subarray(8, 12).toString('ascii') !== 'WEBP'
+    ) {
+      return { ok: false, error: 'Invalid WEBP signature header.' };
     }
   }
 

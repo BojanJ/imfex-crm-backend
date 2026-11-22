@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { formatProductForResponse } from '../lib/formatters';
+import { ROLE_GROUPS, requireRole } from '../auth';
 import {
   isUuid,
   SPEC_INPUT_TYPES,
@@ -33,7 +34,7 @@ catalogRouter.get('/categories', async (req, res) => {
   }
 });
 
-catalogRouter.post('/categories', async (req, res) => {
+catalogRouter.post('/categories', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async (req, res) => {
   try {
     const { id, name, parentId } = req.body ?? {};
     const cleanName = typeof name === 'string' ? name.trim() : '';
@@ -63,7 +64,7 @@ catalogRouter.post('/categories', async (req, res) => {
   }
 });
 
-catalogRouter.delete('/categories/:id', async (req, res) => {
+catalogRouter.delete('/categories/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {
@@ -104,7 +105,7 @@ catalogRouter.get('/products', async (req, res) => {
   }
 });
 
-catalogRouter.post('/products', async (req, res) => {
+catalogRouter.post('/products', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async (req, res) => {
   try {
     const {
       id,
@@ -349,7 +350,7 @@ catalogRouter.post('/products', async (req, res) => {
   }
 });
 
-catalogRouter.delete('/products/:id', async (req, res) => {
+catalogRouter.delete('/products/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

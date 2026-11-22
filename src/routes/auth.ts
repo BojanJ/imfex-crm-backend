@@ -12,8 +12,11 @@ import {
 import { escapeHtml, isValidEmail, createRateLimiter } from '../security';
 import { handleRouteError } from '../validation';
 import { logger } from '../logger';
-import { recordAudit } from '../audit';
+import { recordAudit, getClientIp } from '../audit';
 import { generateResetToken, hashResetToken, buildResetPasswordUrl } from '../password-reset';
+
+// Precomputed valid bcrypt hash (cost 10) for constant-time login mitigation when account does not exist (SEC-16)
+const DUMMY_PASSWORD_HASH = '$2b$10$CwTycUXWue0Thq9StjUM0uJ8d2P0tV8V8lX8m5P2uW5m2v8H0y5xW';
 
 const loginLimiter = createRateLimiter({
   windowMs: 15 * 60 * 1000,
@@ -46,7 +49,9 @@ publicAuthRouter.post('/login', loginLimiter, async (req, res) => {
     });
 
     if (!user || user.status === 'DISABLED' || !user.passwordHash) {
-      return res.status(401).json({ error: 'Invalid credentials or account disabled' });
+      // Constant-time mitigation against email/status enumeration (SEC-16)
+      await bcrypt.compare(cleanPassword, DUMMY_PASSWORD_HASH);
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const isValid = await bcrypt.compare(cleanPassword, user.passwordHash);
@@ -61,10 +66,7 @@ publicAuthRouter.post('/login', loginLimiter, async (req, res) => {
       entityId: user.id,
       actorUserId: user.id,
       actorEmail: user.email,
-      ipAddress:
-        typeof req.headers['x-forwarded-for'] === 'string'
-          ? req.headers['x-forwarded-for'].split(',')[0].trim()
-          : req.ip || null,
+      ipAddress: getClientIp(req as AuthenticatedRequest),
     });
     res.json({
       token,
@@ -144,10 +146,7 @@ publicAuthRouter.post('/forgot-password', passwordLimiter, async (req, res) => {
       entityId: user.id,
       actorUserId: user.id,
       actorEmail: user.email,
-      ipAddress:
-        typeof req.headers['x-forwarded-for'] === 'string'
-          ? req.headers['x-forwarded-for'].split(',')[0].trim()
-          : req.ip || null,
+      ipAddress: getClientIp(req as AuthenticatedRequest),
     });
 
     return res.json(genericResponse);
@@ -156,7 +155,7 @@ publicAuthRouter.post('/forgot-password', passwordLimiter, async (req, res) => {
   }
 });
 
-// Public Reset Password Endpoint (IMP-06) — validates single-use SHA-256 token and sets new password
+// Public Reset Password Endpoint (IMP-06, SEC-14, SEC-16) — atomically claims single-use token, revokes active JWTs
 publicAuthRouter.post('/reset-password', passwordLimiter, async (req, res) => {
   try {
     const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
@@ -175,7 +174,8 @@ publicAuthRouter.post('/reset-password', passwordLimiter, async (req, res) => {
       include: { profile: true },
     });
 
-    if (!record || record.usedAt || record.expiresAt.getTime() <= Date.now()) {
+    const now = new Date();
+    if (!record || record.usedAt || record.expiresAt.getTime() <= now.getTime()) {
       return res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
     }
     if (record.profile.status === 'DISABLED') {
@@ -183,16 +183,43 @@ publicAuthRouter.post('/reset-password', passwordLimiter, async (req, res) => {
     }
 
     const nextHash = await bcrypt.hash(newPassword, 10);
-    await prisma.$transaction([
-      prisma.profile.update({
+    const claimed = await prisma.$transaction(async (tx) => {
+      // Atomic single-use token claim prevents concurrent TOCTOU reuse (SEC-16)
+      const claimRes = await tx.passwordResetToken.updateMany({
+        where: {
+          id: record.id,
+          usedAt: null,
+          expiresAt: { gt: now },
+        },
+        data: { usedAt: now },
+      });
+      if (claimRes.count !== 1) {
+        return false;
+      }
+
+      // Invalidate any other unused reset tokens for the same user
+      await tx.passwordResetToken.updateMany({
+        where: {
+          profileId: record.profileId,
+          usedAt: null,
+        },
+        data: { usedAt: now },
+      });
+
+      await tx.profile.update({
         where: { id: record.profileId },
-        data: { passwordHash: nextHash, mustChangePassword: false },
-      }),
-      prisma.passwordResetToken.update({
-        where: { id: record.id },
-        data: { usedAt: new Date() },
-      }),
-    ]);
+        data: {
+          passwordHash: nextHash,
+          mustChangePassword: false,
+          tokenVersion: { increment: 1 },
+        },
+      });
+      return true;
+    });
+
+    if (!claimed) {
+      return res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
+    }
 
     invalidateAuthUserCache(record.profileId);
     void recordAudit(prisma, undefined, {
@@ -201,10 +228,7 @@ publicAuthRouter.post('/reset-password', passwordLimiter, async (req, res) => {
       entityId: record.profileId,
       actorUserId: record.profileId,
       actorEmail: record.profile.email,
-      ipAddress:
-        typeof req.headers['x-forwarded-for'] === 'string'
-          ? req.headers['x-forwarded-for'].split(',')[0].trim()
-          : req.ip || null,
+      ipAddress: getClientIp(req as AuthenticatedRequest),
     });
 
     return res.json({ success: true, message: 'Password has been reset successfully.' });
@@ -243,15 +267,24 @@ protectedAuthRouter.post('/change-password', passwordLimiter, async (req: Authen
     }
 
     const nextHash = await bcrypt.hash(newPassword, 10);
-    const updated = await prisma.profile.update({
+    const updatedWithVersion = await prisma.profile.update({
       where: { id: user.id },
-      data: { passwordHash: nextHash, mustChangePassword: false },
-      select: SAFE_PROFILE_SELECT,
+      data: {
+        passwordHash: nextHash,
+        mustChangePassword: false,
+        tokenVersion: { increment: 1 },
+      },
+      select: {
+        ...SAFE_PROFILE_SELECT,
+        tokenVersion: true,
+      },
     });
     invalidateAuthUserCache(user.id);
+    const freshToken = signAuthToken(updatedWithVersion);
+    const updated = stripPasswordHash(updatedWithVersion);
     void recordAudit(prisma, req, { action: 'PASSWORD_CHANGED', entityType: 'Profile', entityId: user.id });
 
-    res.json({ success: true, user: updated });
+    res.json({ success: true, token: freshToken, user: updated });
   } catch (error: any) {
     logger.error('change_password_error', { error: error?.message || String(error) });
     res.status(500).json({ error: 'Failed to change password.' });

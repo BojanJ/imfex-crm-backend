@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { formatOfferForResponse } from '../lib/formatters';
-import { SAFE_PROFILE_SELECT, AuthenticatedRequest } from '../auth';
+import { SAFE_PROFILE_SELECT, AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import {
   isUuid,
   OFFER_STATUSES,
@@ -68,7 +68,7 @@ offersRouter.get('/:id', async (req, res) => {
   }
 });
 
-offersRouter.post('/', async (req, res) => {
+offersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, res) => {
   try {
     const {
       id,
@@ -312,7 +312,7 @@ offersRouter.post('/', async (req, res) => {
   }
 });
 
-offersRouter.delete('/:id', async (req, res) => {
+offersRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

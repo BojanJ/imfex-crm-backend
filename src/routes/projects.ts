@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { extractWorkflowData, formatProjectForResponse } from '../lib/formatters';
-import { SAFE_PROFILE_SELECT, AuthenticatedRequest } from '../auth';
+import { SAFE_PROFILE_SELECT, AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
+import { validateSignatureUrl } from '../security';
 import {
   isUuid,
   PROJECT_STATUSES,
@@ -65,7 +66,7 @@ projectsRouter.get('/:id', async (req, res) => {
   }
 });
 
-projectsRouter.post('/', async (req, res) => {
+projectsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
     const {
       projectNumber,
@@ -148,6 +149,11 @@ projectsRouter.post('/', async (req, res) => {
       return res.status(400).json({ error: 'A valid customerId UUID is required.' });
     }
 
+    const sigCheck = validateSignatureUrl(signatureUrl);
+    if (!sigCheck.ok) {
+      return res.status(400).json({ error: sigCheck.error });
+    }
+
     let validRespUser: string | null = null;
     if (responsibleUserId !== undefined && responsibleUserId !== null && responsibleUserId !== '') {
       if (!isUuid(responsibleUserId)) {
@@ -221,7 +227,7 @@ projectsRouter.post('/', async (req, res) => {
   }
 });
 
-projectsRouter.delete('/:id', async (req, res) => {
+projectsRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

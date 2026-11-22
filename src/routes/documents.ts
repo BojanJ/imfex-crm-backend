@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
+import { ROLE_GROUPS, requireRole } from '../auth';
 import { validateDocumentUpload } from '../security';
 import { isUuid, parsePagination, buildPrismaPaginationArgs, handleRouteError } from '../validation';
 import {
@@ -94,7 +95,7 @@ documentsRouter.get('/:id/download', async (req, res) => {
   }
 });
 
-documentsRouter.post('/', async (req, res) => {
+documentsRouter.post('/', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
     const { id, customerId, offerId, projectId, serviceId, title, fileType, fileUrl, fileName, sizeBytes } = req.body ?? {};
 
@@ -213,7 +214,7 @@ documentsRouter.post('/', async (req, res) => {
   }
 });
 
-documentsRouter.delete('/:id', async (req, res) => {
+documentsRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

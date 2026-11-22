@@ -14,10 +14,7 @@ export interface AuditEntryInput {
 
 export function getClientIp(req?: AuthenticatedRequest): string | null {
   if (!req) return null;
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.trim()) {
-    return fwd.split(',')[0].trim();
-  }
+  // Rely on Express req.ip (respecting `trust proxy`) instead of spoofable leftmost X-Forwarded-For
   return req.ip || req.socket?.remoteAddress || null;
 }
 

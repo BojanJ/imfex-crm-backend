@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { resend, EMAIL_FROM } from '../lib/email';
-import { AuthenticatedRequest } from '../auth';
+import { AuthenticatedRequest, ROLE_GROUPS, requireRole } from '../auth';
 import { escapeHtml, isValidEmail, createRateLimiter } from '../security';
 import { logger } from '../logger';
 import { recordAudit } from '../audit';
@@ -15,7 +15,7 @@ const emailLimiter = createRateLimiter({
 
 export const emailRouter = Router();
 
-emailRouter.post('/send-offer', emailLimiter, async (req, res) => {
+emailRouter.post('/send-offer', requireRole(...ROLE_GROUPS.EMAIL_OFFER), emailLimiter, async (req, res) => {
   try {
     const { to, customerName, offerNumber, totalAmount, pdfBase64, customMessage } = req.body ?? {};
 
@@ -115,7 +115,7 @@ emailRouter.post('/send-offer', emailLimiter, async (req, res) => {
 });
 
 // 2. Send Sales Invoice / Dispatch Note PDF to Customer (authenticated, rate-limited, HTML-escaped)
-emailRouter.post('/send-invoice', emailLimiter, async (req, res) => {
+emailRouter.post('/send-invoice', requireRole(...ROLE_GROUPS.EMAIL_INVOICE), emailLimiter, async (req, res) => {
   try {
     const {
       to,

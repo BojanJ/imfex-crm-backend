@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
+import { ROLE_GROUPS, requireRole } from '../auth';
 import { formatPurchaseInvoice, formatSalesInvoice, formatPaymentRecord } from '../lib/formatters';
 import { parseFiniteNumber, parsePagination, buildPrismaPaginationArgs, handleRouteError } from '../validation';
 
 export const financeRouter = Router();
 
 // Purchase Invoices
-financeRouter.get('/purchase-invoices', async (req, res) => {
+financeRouter.get('/purchase-invoices', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
@@ -24,7 +25,7 @@ financeRouter.get('/purchase-invoices', async (req, res) => {
   }
 });
 
-financeRouter.post('/purchase-invoices', async (req, res) => {
+financeRouter.post('/purchase-invoices', requireRole(...ROLE_GROUPS.FINANCE_WRITE), async (req, res) => {
   try {
     const b = req.body ?? {};
     if (!b?.id || !b?.internalNumber) {
@@ -71,7 +72,7 @@ financeRouter.post('/purchase-invoices', async (req, res) => {
   }
 });
 
-financeRouter.delete('/purchase-invoices/:id', async (req, res) => {
+financeRouter.delete('/purchase-invoices/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     await prisma.purchaseInvoice.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
@@ -81,7 +82,7 @@ financeRouter.delete('/purchase-invoices/:id', async (req, res) => {
 });
 
 // Sales Invoices
-financeRouter.get('/sales-invoices', async (req, res) => {
+financeRouter.get('/sales-invoices', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
@@ -99,7 +100,7 @@ financeRouter.get('/sales-invoices', async (req, res) => {
   }
 });
 
-financeRouter.post('/sales-invoices', async (req, res) => {
+financeRouter.post('/sales-invoices', requireRole(...ROLE_GROUPS.FINANCE_SALES_WRITE), async (req, res) => {
   try {
     const b = req.body ?? {};
     if (!b?.id || !b?.invoiceNumber) {
@@ -149,7 +150,7 @@ financeRouter.post('/sales-invoices', async (req, res) => {
   }
 });
 
-financeRouter.delete('/sales-invoices/:id', async (req, res) => {
+financeRouter.delete('/sales-invoices/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     await prisma.salesInvoice.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
@@ -177,7 +178,7 @@ financeRouter.get('/dispatch-notes', async (req, res) => {
   }
 });
 
-financeRouter.post('/dispatch-notes', async (req, res) => {
+financeRouter.post('/dispatch-notes', requireRole(...ROLE_GROUPS.FINANCE_SALES_WRITE), async (req, res) => {
   try {
     const b = req.body ?? {};
     if (!b?.id || !b?.dispatchNumber) {
@@ -209,7 +210,7 @@ financeRouter.post('/dispatch-notes', async (req, res) => {
   }
 });
 
-financeRouter.delete('/dispatch-notes/:id', async (req, res) => {
+financeRouter.delete('/dispatch-notes/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     await prisma.dispatchNote.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
@@ -219,7 +220,7 @@ financeRouter.delete('/dispatch-notes/:id', async (req, res) => {
 });
 
 // Payments
-financeRouter.get('/payments', async (req, res) => {
+financeRouter.get('/payments', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
@@ -237,7 +238,7 @@ financeRouter.get('/payments', async (req, res) => {
   }
 });
 
-financeRouter.post('/payments', async (req, res) => {
+financeRouter.post('/payments', requireRole(...ROLE_GROUPS.FINANCE_SALES_WRITE), async (req, res) => {
   try {
     const b = req.body ?? {};
     if (!b?.id || !b?.paymentNumber) {
@@ -273,7 +274,7 @@ financeRouter.post('/payments', async (req, res) => {
   }
 });
 
-financeRouter.delete('/payments/:id', async (req, res) => {
+financeRouter.delete('/payments/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     await prisma.paymentRecord.delete({ where: { id: String(req.params.id) } });
     res.json({ success: true, id: req.params.id });
@@ -301,7 +302,7 @@ financeRouter.get('/inventory-movements', async (req, res) => {
   }
 });
 
-financeRouter.post('/inventory-movements', async (req, res) => {
+financeRouter.post('/inventory-movements', requireRole(...ROLE_GROUPS.FINANCE_SALES_WRITE), async (req, res) => {
   try {
     const b = req.body ?? {};
     if (!b?.id || !b?.kind || !b?.detail) {

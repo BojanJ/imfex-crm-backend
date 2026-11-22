@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { formatOfferForResponse, formatTicketForResponse } from '../lib/formatters';
+import { ROLE_GROUPS, requireRole } from '../auth';
 import { isValidEmail } from '../security';
 import {
   isUuid,
@@ -43,7 +44,7 @@ customersRouter.get('/', async (req, res) => {
   }
 });
 
-customersRouter.post('/', async (req, res) => {
+customersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, res) => {
   try {
     const { id, name, companyName, taxId, customerType, email, phone, address, city, notes } = req.body ?? {};
     const cleanName = typeof name === 'string' ? name.trim() : '';
@@ -83,7 +84,7 @@ customersRouter.post('/', async (req, res) => {
   }
 });
 
-customersRouter.delete('/:id', async (req, res) => {
+customersRouter.delete('/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

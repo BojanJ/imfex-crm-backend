@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma';
 import { formatProductForResponse, formatTicketForResponse } from '../lib/formatters';
-import { SAFE_PROFILE_SELECT } from '../auth';
+import { SAFE_PROFILE_SELECT, ROLE_GROUPS, requireRole } from '../auth';
 import {
   isUuid,
   SERVICE_PRIORITIES,
@@ -61,7 +61,7 @@ serviceRouter.get('/service-tickets/:id', async (req, res) => {
   }
 });
 
-serviceRouter.post('/service-tickets', async (req, res) => {
+serviceRouter.post('/service-tickets', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
     const {
       ticketNumber,
@@ -161,7 +161,7 @@ serviceRouter.post('/service-tickets', async (req, res) => {
   }
 });
 
-serviceRouter.delete('/service-tickets/:id', async (req, res) => {
+serviceRouter.delete('/service-tickets/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {
@@ -199,7 +199,7 @@ serviceRouter.get('/installed-items', async (req, res) => {
   }
 });
 
-serviceRouter.post('/installed-items', async (req, res) => {
+serviceRouter.post('/installed-items', requireRole(...ROLE_GROUPS.OPERATIONS_WRITE), async (req, res) => {
   try {
     const { id, customerId, projectId, productId, title, serialNumber, installationDate } = req.body ?? {};
     const cleanTitle = typeof title === 'string' ? title.trim() : '';
@@ -268,7 +268,7 @@ serviceRouter.post('/installed-items', async (req, res) => {
   }
 });
 
-serviceRouter.delete('/installed-items/:id', async (req, res) => {
+serviceRouter.delete('/installed-items/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_DELETE), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

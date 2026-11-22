@@ -7,7 +7,7 @@ export function isUuid(value: unknown): value is string {
   return typeof value === 'string' && UUID_REGEX.test(value.trim());
 }
 
-export const USER_ROLES = ['SUPER_ADMIN', 'USER'] as const;
+export const USER_ROLES = ['SUPER_ADMIN', 'SALES', 'ACCOUNTANT', 'TECHNICIAN', 'USER'] as const;
 export const SPEC_INPUT_TYPES = ['SELECT', 'MULTISELECT', 'TEXT', 'NUMBER'] as const;
 export const CUSTOMER_TYPES = ['INDIVIDUAL', 'COMPANY', 'PARTNER', 'OTHER'] as const;
 export const OFFER_STATUSES = ['DRAFT', 'SENT', 'ACCEPTED', 'REJECTED', 'EXPIRED'] as const;

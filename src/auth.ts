@@ -12,6 +12,11 @@ export const SAFE_PROFILE_SELECT = {
   createdAt: true,
 } as const;
 
+const AUTH_PROFILE_SELECT = {
+  ...SAFE_PROFILE_SELECT,
+  tokenVersion: true,
+} as const;
+
 export interface SafeUserProfile {
   id: string;
   email: string;
@@ -22,13 +27,31 @@ export interface SafeUserProfile {
   createdAt: Date;
 }
 
+interface CachedAuthUser extends SafeUserProfile {
+  tokenVersion: number;
+}
+
 export interface AuthTokenPayload {
   sub: string;
   email: string;
   role: UserRole;
+  tv: number;
   iat: number;
   exp: number;
 }
+
+export const ROLE_GROUPS = {
+  ADMIN_ONLY: ['SUPER_ADMIN'] as UserRole[],
+  DESTRUCTIVE_DELETE: ['SUPER_ADMIN'] as UserRole[],
+  FINANCE_READ: ['SUPER_ADMIN', 'ACCOUNTANT', 'SALES'] as UserRole[],
+  FINANCE_WRITE: ['SUPER_ADMIN', 'ACCOUNTANT'] as UserRole[],
+  FINANCE_SALES_WRITE: ['SUPER_ADMIN', 'ACCOUNTANT', 'SALES'] as UserRole[],
+  CATALOG_WRITE: ['SUPER_ADMIN', 'SALES'] as UserRole[],
+  CRM_SALES_WRITE: ['SUPER_ADMIN', 'SALES', 'USER'] as UserRole[],
+  OPERATIONS_WRITE: ['SUPER_ADMIN', 'SALES', 'TECHNICIAN', 'USER'] as UserRole[],
+  EMAIL_OFFER: ['SUPER_ADMIN', 'SALES'] as UserRole[],
+  EMAIL_INVOICE: ['SUPER_ADMIN', 'ACCOUNTANT', 'SALES'] as UserRole[],
+} as const;
 
 export interface AuthenticatedRequest extends Request {
   user?: SafeUserProfile;
@@ -71,7 +94,12 @@ function base64UrlDecode(input: string): Buffer {
   return Buffer.from(normalized + '='.repeat(padding), 'base64');
 }
 
-export function signAuthToken(user: { id: string; email: string; role: UserRole }): string {
+export function signAuthToken(user: {
+  id: string;
+  email: string;
+  role: UserRole;
+  tokenVersion?: number;
+}): string {
   const secret = getJwtSecret();
   const ttlRaw = Number(process.env.JWT_EXPIRES_IN_SECONDS);
   const ttlSeconds = Number.isFinite(ttlRaw) && ttlRaw > 0 ? ttlRaw : DEFAULT_TOKEN_TTL_SECONDS;
@@ -82,6 +110,7 @@ export function signAuthToken(user: { id: string; email: string; role: UserRole 
     sub: user.id,
     email: user.email,
     role: user.role,
+    tv: typeof user.tokenVersion === 'number' ? user.tokenVersion : 0,
     iat: now,
     exp: now + ttlSeconds,
   };
@@ -136,8 +165,8 @@ export function verifyAuthToken(token: string): AuthTokenPayload | null {
 }
 
 const AUTH_USER_CACHE_TTL_MS = 30_000;
-const authUserCache = new Map<string, { user: SafeUserProfile | null; expiresAt: number }>();
-const inFlightUserLookups = new Map<string, Promise<SafeUserProfile | null>>();
+const authUserCache = new Map<string, { user: CachedAuthUser | null; expiresAt: number }>();
+const inFlightUserLookups = new Map<string, Promise<CachedAuthUser | null>>();
 
 export function invalidateAuthUserCache(userId?: string) {
   if (userId) {
@@ -147,8 +176,10 @@ export function invalidateAuthUserCache(userId?: string) {
   }
 }
 
+const MUST_CHANGE_PASSWORD_ALLOWED_PATHS = new Set(['/auth/me', '/auth/change-password']);
+
 export function createRequireAuth(prisma: PrismaClient) {
-  async function loadAuthenticatedUser(userId: string): Promise<SafeUserProfile | null> {
+  async function loadAuthenticatedUser(userId: string): Promise<CachedAuthUser | null> {
     const now = Date.now();
     const cached = authUserCache.get(userId);
     if (cached && cached.expiresAt > now) {
@@ -163,7 +194,7 @@ export function createRequireAuth(prisma: PrismaClient) {
     const lookupPromise = prisma.profile
       .findUnique({
         where: { id: userId },
-        select: SAFE_PROFILE_SELECT,
+        select: AUTH_PROFILE_SELECT,
       })
       .then((user) => {
         if (authUserCache.size > 1000) {
@@ -206,13 +237,29 @@ export function createRequireAuth(prisma: PrismaClient) {
     }
 
     try {
-      const user = await loadAuthenticatedUser(payload.sub);
+      const dbUser = await loadAuthenticatedUser(payload.sub);
 
-      if (!user || user.status === 'DISABLED') {
+      if (!dbUser || dbUser.status === 'DISABLED') {
         return res.status(401).json({ error: 'Account not found or disabled' });
       }
 
-      req.user = user;
+      const tokenVersion = typeof payload.tv === 'number' ? payload.tv : 0;
+      if (tokenVersion !== dbUser.tokenVersion) {
+        return res.status(401).json({ error: 'Session has been revoked. Please sign in again.' });
+      }
+
+      const { tokenVersion: _tv, ...safeUser } = dbUser;
+      req.user = safeUser;
+
+      // Enforce mustChangePassword server-side (SEC-14): only allow /auth/me and /auth/change-password
+      const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+      if (safeUser.mustChangePassword && !MUST_CHANGE_PASSWORD_ALLOWED_PATHS.has(normalizedPath)) {
+        return res.status(403).json({
+          error: 'Password change required before accessing this resource.',
+          code: 'MUST_CHANGE_PASSWORD',
+        });
+      }
+
       return next();
     } catch (error) {
       console.error('Auth verification DB error:', error);
@@ -237,9 +284,9 @@ export function requireRole(...allowedRoles: UserRole[]) {
   };
 }
 
-export function stripPasswordHash<T extends { passwordHash?: unknown }>(
+export function stripPasswordHash<T extends { passwordHash?: unknown; tokenVersion?: unknown }>(
   profile: T
-): Omit<T, 'passwordHash'> {
-  const { passwordHash: _removed, ...safe } = profile;
+): Omit<T, 'passwordHash' | 'tokenVersion'> {
+  const { passwordHash: _removedHash, tokenVersion: _removedTv, ...safe } = profile;
   return safe;
 }

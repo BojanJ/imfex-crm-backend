@@ -48,10 +48,11 @@ profilesRouter.post('/', requireRole('SUPER_ADMIN'), async (req, res) => {
     const roleCheck = parseEnum(role, USER_ROLES, 'role', 'USER');
     if (!roleCheck.ok) return res.status(400).json({ error: roleCheck.error });
 
-    const rawPassword =
-      typeof password === 'string' && password.trim().length >= 8
-        ? password.trim()
-        : generateSecureTempPassword(12);
+    const providedPassword = typeof password === 'string' ? password.trim() : '';
+    if (providedPassword.length > 0 && providedPassword.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
+    }
+    const rawPassword = providedPassword.length >= 8 ? providedPassword : generateSecureTempPassword(12);
     const passwordHash = await bcrypt.hash(rawPassword, 10);
     const profile = await prisma.profile.upsert({
       where: { email: email.trim().toLowerCase() },
@@ -66,6 +67,7 @@ profilesRouter.post('/', requireRole('SUPER_ADMIN'), async (req, res) => {
       },
       select: SAFE_PROFILE_SELECT,
     });
+    invalidateAuthUserCache(profile.id);
     void recordAudit(prisma, req as AuthenticatedRequest, {
       action: 'PROFILE_UPSERTED',
       entityType: 'Profile',
@@ -93,34 +95,81 @@ profilesRouter.put('/:id', async (req: AuthenticatedRequest, res) => {
 
     const { fullName, role, status, password, mustChangePassword } = req.body ?? {};
     const updateData: any = {};
+    let shouldRevokeSessions = false;
+
     if (fullName !== undefined) updateData.fullName = fullName;
     if (isSuperAdmin) {
       if (role !== undefined) {
         const roleCheck = parseEnum(role, USER_ROLES, 'role');
         if (!roleCheck.ok) return res.status(400).json({ error: roleCheck.error });
+        if (isSelf && roleCheck.value !== 'SUPER_ADMIN') {
+          return res.status(400).json({ error: 'Cannot demote your own SUPER_ADMIN account.' });
+        }
         updateData.role = roleCheck.value;
       }
       if (status !== undefined) {
         if (status !== 'ACTIVE' && status !== 'DISABLED') {
           return res.status(400).json({ error: 'Invalid status. Allowed values: ACTIVE, DISABLED.' });
         }
+        if (isSelf && status === 'DISABLED') {
+          return res.status(400).json({ error: 'Cannot disable your own active account.' });
+        }
         updateData.status = status;
       }
     } else if (role !== undefined || status !== undefined) {
       return res.status(403).json({ error: 'Only SUPER_ADMIN can modify role or status' });
     }
-    if (typeof password === 'string' && password.length > 0) {
-      if (password.length < 8) {
+
+    // SEC-12: Prevent self-service password change bypass without currentPassword/rate limit
+    if (password !== undefined && password !== null && password !== '') {
+      if (isSelf) {
+        return res.status(400).json({
+          error: 'Use POST /api/auth/change-password to change your own password.',
+        });
+      }
+      if (!isSuperAdmin) {
+        return res.status(403).json({ error: 'Insufficient permissions' });
+      }
+      if (typeof password !== 'string' || password.length < 8) {
         return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
       }
       updateData.passwordHash = await bcrypt.hash(password, 10);
-      if (isSuperAdmin && !isSelf) {
-        updateData.mustChangePassword = mustChangePassword !== undefined ? Boolean(mustChangePassword) : true;
-      } else {
-        updateData.mustChangePassword = false;
-      }
+      updateData.mustChangePassword = mustChangePassword !== undefined ? Boolean(mustChangePassword) : true;
+      shouldRevokeSessions = true;
     } else if (isSuperAdmin && mustChangePassword !== undefined) {
       updateData.mustChangePassword = Boolean(mustChangePassword);
+    }
+
+    // SEC-16: Prevent demoting or disabling the last active SUPER_ADMIN
+    if (
+      isSuperAdmin &&
+      ((updateData.role !== undefined && updateData.role !== 'SUPER_ADMIN') ||
+        updateData.status === 'DISABLED')
+    ) {
+      const targetUser = await prisma.profile.findUnique({
+        where: { id },
+        select: { role: true, status: true },
+      });
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Profile not found.' });
+      }
+      if (targetUser.role === 'SUPER_ADMIN' && targetUser.status === 'ACTIVE') {
+        const otherActiveAdmins = await prisma.profile.count({
+          where: { role: 'SUPER_ADMIN', status: 'ACTIVE', id: { not: id } },
+        });
+        if (otherActiveAdmins === 0) {
+          return res.status(400).json({
+            error: 'Cannot demote or disable the last active SUPER_ADMIN account.',
+          });
+        }
+      }
+    }
+
+    if (updateData.role !== undefined || updateData.status !== undefined) {
+      shouldRevokeSessions = true;
+    }
+    if (shouldRevokeSessions) {
+      updateData.tokenVersion = { increment: 1 };
     }
 
     const profile = await prisma.profile.update({

@@ -181,6 +181,9 @@ catalogRouter.post('/products', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async
       stockType,
       stockQuantity,
       reservedQuantity,
+      minStockLevel,
+      primarySupplierId,
+      barcode,
       purchasePrice,
       models,
       specificationKeys,
@@ -242,10 +245,23 @@ catalogRouter.post('/products', requireRole(...ROLE_GROUPS.CATALOG_WRITE), async
       }
     }
 
+    const minStockCheck =
+      minStockLevel !== undefined && minStockLevel !== null && minStockLevel !== ''
+        ? parseFiniteNumber(minStockLevel, 'minStockLevel', { min: 0, max: 100000, integer: true })
+        : null;
+    if (minStockCheck && !minStockCheck.ok) return res.status(400).json({ error: minStockCheck.error });
+
     const stockFields = {
       ...(stockType !== undefined ? { stockType: String(stockType) } : {}),
       ...(stockQtyCheck?.ok ? { stockQuantity: stockQtyCheck.value } : {}),
       ...(reservedQtyCheck?.ok ? { reservedQuantity: reservedQtyCheck.value } : {}),
+      ...(minStockCheck?.ok ? { minStockLevel: minStockCheck.value } : {}),
+      ...(primarySupplierId !== undefined
+        ? { primarySupplierId: typeof primarySupplierId === 'string' && primarySupplierId.trim() ? primarySupplierId.trim() : null }
+        : {}),
+      ...(barcode !== undefined
+        ? { barcode: typeof barcode === 'string' && barcode.trim() ? barcode.trim().slice(0, 128) : null }
+        : {}),
       ...(purchasePriceCheck?.ok ? { purchasePrice: purchasePriceCheck.value } : {}),
     };
 

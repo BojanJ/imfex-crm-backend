@@ -104,6 +104,9 @@ model Product {
   stockType         String             @default("STOCK") @map("stock_type")
   stockQuantity     Int                @default(0) @map("stock_quantity")
   reservedQuantity  Int                @default(0) @map("reserved_quantity")
+  minStockLevel     Int                @default(3) @map("min_stock_level")
+  primarySupplierId String?            @map("primary_supplier_id")
+  barcode           String?
   purchasePrice     Decimal            @default(0.00) @map("purchase_price") @db.Decimal(12, 2)
   createdAt         DateTime           @default(now()) @map("created_at")
   models            ProductModel[]
@@ -400,6 +403,7 @@ model PurchaseInvoice {
   offerId               String?  @map("offer_id")
   issueDate             String   @map("issue_date")
   dueDate               String?  @map("due_date")
+  expectedDeliveryDate  String?  @map("expected_delivery_date")
   status                String   @default("INVOICED")
   receiptStatus         String   @default("PENDING") @map("receipt_status")
   taxRate               Decimal  @default(18.00) @map("tax_rate") @db.Decimal(5, 2)
@@ -440,6 +444,9 @@ model SalesInvoice {
   advanceDeductedAmount      Decimal  @default(0.00) @map("advance_deducted_amount") @db.Decimal(12, 2)
   totalAmount                Decimal  @default(0.00) @map("total_amount") @db.Decimal(12, 2)
   paidAmount                 Decimal  @default(0.00) @map("paid_amount") @db.Decimal(12, 2)
+  exchangeRate               Decimal? @map("exchange_rate") @db.Decimal(10, 4)
+  voidReason                 String?  @map("void_reason")
+  relatedInvoiceId           String?  @map("related_invoice_id")
   notes                      String?
   items                      Json     @default("[]")
   createdAt                  DateTime @default(now()) @map("created_at")
@@ -533,6 +540,7 @@ model CompanySettings {
   oversizeRatePerSqm     Decimal  @default(45.00) @map("oversize_rate_per_sqm") @db.Decimal(10, 2)
   defaultHourlyLaborRate Decimal  @default(25.00) @map("default_hourly_labor_rate") @db.Decimal(10, 2)
   minMarginPercent       Decimal  @default(15.00) @map("min_margin_percent") @db.Decimal(5, 2)
+  eurToMkdRate           Decimal  @default(61.5000) @map("eur_to_mkd_rate") @db.Decimal(10, 4)
   updatedAt              DateTime @updatedAt @map("updated_at")
 
   @@map("company_settings")

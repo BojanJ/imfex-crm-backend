@@ -181,6 +181,20 @@ describe('Modular Express App & Routing (IMP-01)', () => {
       method: 'DELETE',
     });
     expect(delNoteRes.status).toBe(401);
+
+    const voidRes = await fetch(`${baseUrl}/api/sales-invoices/${sampleId}/void`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'Test void' }),
+    });
+    expect(voidRes.status).toBe(401);
+
+    const reminderRes = await fetch(`${baseUrl}/api/email/send-payment-reminder`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: 'client@example.com', invoiceNumber: 'FAK-2026-0001' }),
+    });
+    expect(reminderRes.status).toBe(401);
   });
 
   it('flattens project workflowData and strips document base64 payloads by default (IMP-11)', () => {

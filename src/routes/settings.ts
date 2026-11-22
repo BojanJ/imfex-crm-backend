@@ -13,6 +13,7 @@ const formatSettings = (s: any) => ({
   oversizeRatePerSqm: Number(s.oversizeRatePerSqm ?? 45),
   defaultHourlyLaborRate: Number(s.defaultHourlyLaborRate ?? 25),
   minMarginPercent: Number(s.minMarginPercent ?? 15),
+  eurToMkdRate: Number(s.eurToMkdRate ?? 61.5),
 });
 
 settingsRouter.get('/', async (_req, res) => {
@@ -43,6 +44,7 @@ settingsRouter.put('/', requireRole('SUPER_ADMIN'), async (req, res) => {
       oversizeRatePerSqm,
       defaultHourlyLaborRate,
       minMarginPercent,
+      eurToMkdRate,
     } = req.body ?? {};
 
     const companyNameCheck = parseOptionalString(companyName, 'companyName', 200);
@@ -96,6 +98,12 @@ settingsRouter.put('/', requireRole('SUPER_ADMIN'), async (req, res) => {
       if (!check.ok) return res.status(400).json({ error: check.error });
       minMarginVal = check.value;
     }
+    let eurToMkdVal: number | undefined;
+    if (eurToMkdRate !== undefined && eurToMkdRate !== null && eurToMkdRate !== '') {
+      const check = parseFiniteNumber(eurToMkdRate, 'eurToMkdRate', { min: 1, max: 10000 });
+      if (!check.ok) return res.status(400).json({ error: check.error });
+      eurToMkdVal = check.value;
+    }
 
     const updateData = {
       ...(companyNameCheck.value ? { companyName: companyNameCheck.value.trim() } : {}),
@@ -111,6 +119,7 @@ settingsRouter.put('/', requireRole('SUPER_ADMIN'), async (req, res) => {
       ...(oversizeRateVal !== undefined ? { oversizeRatePerSqm: oversizeRateVal } : {}),
       ...(hourlyLaborVal !== undefined ? { defaultHourlyLaborRate: hourlyLaborVal } : {}),
       ...(minMarginVal !== undefined ? { minMarginPercent: minMarginVal } : {}),
+      ...(eurToMkdVal !== undefined ? { eurToMkdRate: eurToMkdVal } : {}),
     };
     const settings = await prisma.companySettings.upsert({
       where: { id: 'default' },

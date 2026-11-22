@@ -7,6 +7,9 @@ export const formatProductForResponse = (p: any) => {
     stockType: p.stockType || 'STOCK',
     stockQuantity: Number(p.stockQuantity ?? 0),
     reservedQuantity: Number(p.reservedQuantity ?? 0),
+    minStockLevel: Number(p.minStockLevel ?? 3),
+    primarySupplierId: p.primarySupplierId || null,
+    barcode: p.barcode || null,
     purchasePrice: Number(p.purchasePrice ?? 0),
     models: (p.models || []).map((m: any) => ({
       ...m,
@@ -135,6 +138,7 @@ export const formatPurchaseInvoice = (inv: any) => ({
   taxAmount: Number(inv.taxAmount ?? 0),
   totalAmount: Number(inv.totalAmount ?? 0),
   paidAmount: Number(inv.paidAmount ?? 0),
+  exchangeRate: inv.exchangeRate !== undefined && inv.exchangeRate !== null ? Number(inv.exchangeRate) : undefined,
   items: Array.isArray(inv.items) ? inv.items : [],
 });
 
@@ -149,6 +153,7 @@ export const formatSalesInvoice = (inv: any) => ({
   advanceDeductedAmount: Number(inv.advanceDeductedAmount ?? 0),
   totalAmount: Number(inv.totalAmount ?? 0),
   paidAmount: Number(inv.paidAmount ?? 0),
+  exchangeRate: inv.exchangeRate !== undefined && inv.exchangeRate !== null ? Number(inv.exchangeRate) : undefined,
   items: Array.isArray(inv.items) ? inv.items : [],
 });
 

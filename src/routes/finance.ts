@@ -173,6 +173,8 @@ financeRouter.post('/purchase-invoices', requireRole(...ROLE_GROUPS.FINANCE_WRIT
     }
     const dueDateCheck = parseIsoDateString(b.dueDate, 'dueDate', false);
     if (!dueDateCheck.ok) return res.status(400).json({ error: dueDateCheck.error });
+    const expectedDeliveryCheck = parseIsoDateString(b.expectedDeliveryDate, 'expectedDeliveryDate', false);
+    if (!expectedDeliveryCheck.ok) return res.status(400).json({ error: expectedDeliveryCheck.error });
 
     const taxRateCheck = parseFiniteNumber(b.taxRate, 'taxRate', { min: 0, max: 100, defaultVal: 18 });
     if (!taxRateCheck.ok) return res.status(400).json({ error: taxRateCheck.error });
@@ -194,6 +196,7 @@ financeRouter.post('/purchase-invoices', requireRole(...ROLE_GROUPS.FINANCE_WRIT
       offerId: b.offerId ?? null,
       issueDate: issueDateCheck.value,
       dueDate: dueDateCheck.value,
+      expectedDeliveryDate: expectedDeliveryCheck.value,
       status: statusCheck.value,
       receiptStatus: receiptCheck.value,
       taxRate: taxRateCheck.value,
@@ -332,6 +335,16 @@ financeRouter.post('/sales-invoices', requireRole(...ROLE_GROUPS.FINANCE_SALES_W
     const paidAmountCheck = parseFiniteNumber(b.paidAmount, 'paidAmount', { min: 0, defaultVal: 0 });
     if (!paidAmountCheck.ok) return res.status(400).json({ error: paidAmountCheck.error });
 
+    let exchangeRateVal: number | null = null;
+    if (b.exchangeRate !== undefined && b.exchangeRate !== null && b.exchangeRate !== '') {
+      const fxCheck = parseFiniteNumber(b.exchangeRate, 'exchangeRate', { min: 1, max: 10000 });
+      if (!fxCheck.ok) return res.status(400).json({ error: fxCheck.error });
+      exchangeRateVal = fxCheck.value;
+    } else {
+      const cs = await prisma.companySettings.findUnique({ where: { id: 'default' }, select: { eurToMkdRate: true } });
+      exchangeRateVal = Number(cs?.eurToMkdRate ?? 61.5);
+    }
+
     const resolvedCustomerName = customer.companyName || customer.name;
     const data = {
       invoiceNumber: String(b.invoiceNumber).trim(),
@@ -355,6 +368,9 @@ financeRouter.post('/sales-invoices', requireRole(...ROLE_GROUPS.FINANCE_SALES_W
       advanceDeductedAmount: advanceDeductedCheck.value,
       totalAmount: totalAmountCheck.value,
       paidAmount: paidAmountCheck.value,
+      exchangeRate: exchangeRateVal,
+      voidReason: typeof b.voidReason === 'string' && b.voidReason.trim() ? b.voidReason.trim().slice(0, 500) : null,
+      relatedInvoiceId: b.relatedInvoiceId ?? null,
       notes: b.notes ?? null,
       items: Array.isArray(b.items) ? b.items : [],
     };
@@ -380,6 +396,35 @@ financeRouter.post('/sales-invoices', requireRole(...ROLE_GROUPS.FINANCE_SALES_W
     });
   } catch (error) {
     return handleRouteError(res, error, 'POST /api/sales-invoices');
+  }
+});
+
+// BIZ-10: Allow ACCOUNTANT & SUPER_ADMIN to void/cancel an issued SalesInvoice cleanly with an audit reason
+financeRouter.post('/sales-invoices/:id/void', requireRole(...ROLE_GROUPS.FINANCE_WRITE), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    const existing = await prisma.salesInvoice.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ error: 'Sales invoice not found.' });
+    if (existing.status === 'CANCELLED') {
+      return res.status(400).json({ error: 'Invoice is already voided/cancelled.' });
+    }
+    const updated = await prisma.salesInvoice.update({
+      where: { id },
+      data: {
+        status: 'CANCELLED',
+        voidReason: reason || 'Сторнирана фактура',
+      },
+    });
+    void recordAudit(prisma, req as AuthenticatedRequest, {
+      action: 'SALES_INVOICE_VOIDED',
+      entityType: 'SalesInvoice',
+      entityId: id,
+      metadata: { invoiceNumber: updated.invoiceNumber, reason: updated.voidReason },
+    });
+    res.json(formatSalesInvoice(updated));
+  } catch (error) {
+    return handleRouteError(res, error, 'POST /api/sales-invoices/:id/void');
   }
 });
 

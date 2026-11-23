@@ -16,7 +16,7 @@ import { recordAudit } from '../audit';
 
 export const offersRouter = Router();
 
-offersRouter.get('/', async (req, res) => {
+offersRouter.get('/', requireRole(...ROLE_GROUPS.OFFERS_READ), async (req, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
@@ -46,7 +46,7 @@ offersRouter.get('/', async (req, res) => {
   }
 });
 
-offersRouter.get('/:id', async (req, res) => {
+offersRouter.get('/:id', requireRole(...ROLE_GROUPS.OFFERS_READ), async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {

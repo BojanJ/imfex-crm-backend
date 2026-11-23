@@ -16,7 +16,20 @@ import { recordAudit } from '../audit';
 
 export const customersRouter = Router();
 
-customersRouter.get('/', async (req, res) => {
+function sanitizeCustomerForRole(c: any, role?: string) {
+  const canReadFinance = Boolean(role && ROLE_GROUPS.FINANCE_READ.includes(role as any));
+  const canReadOffers = Boolean(role && ROLE_GROUPS.OFFERS_READ.includes(role as any));
+  const { creditLimit, ...rest } = c;
+  return {
+    ...rest,
+    ...(canReadFinance ? { creditLimit: creditLimit !== null && creditLimit !== undefined ? Number(creditLimit) : null } : {}),
+    offers: canReadOffers ? (c.offers || []).map(formatOfferForResponse) : [],
+    projects: (c.projects || []).map((p: any) => formatProjectForResponse(p)),
+    serviceTickets: (c.serviceTickets || []).map(formatTicketForResponse),
+  };
+}
+
+customersRouter.get('/', async (req: AuthenticatedRequest, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
@@ -37,20 +50,13 @@ customersRouter.get('/', async (req, res) => {
     if (page.value.isPaginated) {
       res.setHeader('X-Total-Count', String(totalCount));
     }
-    res.json(
-      customers.map((c) => ({
-        ...c,
-        offers: (c.offers || []).map(formatOfferForResponse),
-        projects: (c.projects || []).map((p) => formatProjectForResponse(p)),
-        serviceTickets: (c.serviceTickets || []).map(formatTicketForResponse),
-      }))
-    );
+    res.json(customers.map((c) => sanitizeCustomerForRole(c, req.user?.role)));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/customers');
   }
 });
 
-customersRouter.get('/:id', async (req, res) => {
+customersRouter.get('/:id', async (req: AuthenticatedRequest, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {
@@ -66,18 +72,13 @@ customersRouter.get('/:id', async (req, res) => {
       },
     });
     if (!customer) return res.status(404).json({ error: 'Customer not found.' });
-    res.json({
-      ...customer,
-      offers: (customer.offers || []).map(formatOfferForResponse),
-      projects: (customer.projects || []).map((p) => formatProjectForResponse(p)),
-      serviceTickets: (customer.serviceTickets || []).map(formatTicketForResponse),
-    });
+    res.json(sanitizeCustomerForRole(customer, req.user?.role));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/customers/:id');
   }
 });
 
-customersRouter.post('/', requireRole(...ROLE_GROUPS.CRM_SALES_WRITE), async (req, res) => {
+customersRouter.post('/', requireRole(...ROLE_GROUPS.CUSTOMER_WRITE), async (req, res) => {
   try {
     const {
       id,

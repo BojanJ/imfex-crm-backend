@@ -17,7 +17,22 @@ import { recordAudit } from '../audit';
 
 export const projectsRouter = Router();
 
-projectsRouter.get('/', async (req, res) => {
+function sanitizeProjectForRole(project: any, includeDocumentData: boolean, role?: string) {
+  const formatted = formatProjectForResponse(project, includeDocumentData);
+  if (!formatted) return formatted;
+  const canReadOffers = Boolean(role && ROLE_GROUPS.OFFERS_READ.includes(role as any));
+  if (!canReadOffers && formatted.offer) {
+    // Strip commercial pricing/totals for field technicians while preserving offerNumber reference
+    formatted.offer = {
+      id: formatted.offer.id,
+      offerNumber: formatted.offer.offerNumber,
+      status: formatted.offer.status,
+    };
+  }
+  return formatted;
+}
+
+projectsRouter.get('/', async (req: AuthenticatedRequest, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
@@ -40,13 +55,13 @@ projectsRouter.get('/', async (req, res) => {
     if (page.value.isPaginated) {
       res.setHeader('X-Total-Count', String(totalCount));
     }
-    res.json(projects.map((p) => formatProjectForResponse(p, includeData)));
+    res.json(projects.map((p) => sanitizeProjectForRole(p, includeData, req.user?.role)));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/projects');
   }
 });
 
-projectsRouter.get('/:id', async (req, res) => {
+projectsRouter.get('/:id', async (req: AuthenticatedRequest, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {
@@ -64,7 +79,7 @@ projectsRouter.get('/:id', async (req, res) => {
       },
     });
     if (!project) return res.status(404).json({ error: 'Project not found.' });
-    res.json(formatProjectForResponse(project, includeData));
+    res.json(sanitizeProjectForRole(project, includeData, req.user?.role));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/projects/:id');
   }

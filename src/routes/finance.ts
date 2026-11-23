@@ -447,7 +447,7 @@ financeRouter.delete('/sales-invoices/:id', requireRole(...ROLE_GROUPS.DESTRUCTI
 // DISPATCH NOTES (ATOMIC STOCK DEDUCTION + CUSTOMER HYDRATION)
 // =========================================================================
 
-financeRouter.get('/dispatch-notes', async (req, res) => {
+financeRouter.get('/dispatch-notes', requireRole(...ROLE_GROUPS.FINANCE_READ), async (req, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });

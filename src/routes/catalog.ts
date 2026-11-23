@@ -114,8 +114,18 @@ catalogRouter.delete('/categories/:id', requireRole(...ROLE_GROUPS.DESTRUCTIVE_D
   }
 });
 
+function sanitizeProductForRole(product: any, role?: string) {
+  const formatted = formatProductForResponse(product);
+  if (!formatted) return formatted;
+  if (!role || !ROLE_GROUPS.PURCHASE_COST_READ.includes(role as any)) {
+    const { purchasePrice: _hiddenPurchasePrice, ...safe } = formatted;
+    return safe;
+  }
+  return formatted;
+}
+
 // Products API
-catalogRouter.get('/products', async (req, res) => {
+catalogRouter.get('/products', async (req: AuthenticatedRequest, res) => {
   try {
     const page = parsePagination(req.query as Record<string, unknown>);
     if (!page.ok) return res.status(400).json({ error: page.error });
@@ -139,13 +149,13 @@ catalogRouter.get('/products', async (req, res) => {
     if (page.value.isPaginated) {
       res.setHeader('X-Total-Count', String(totalCount));
     }
-    res.json(products.map(formatProductForResponse));
+    res.json(products.map((p) => sanitizeProductForRole(p, req.user?.role)));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/products');
   }
 });
 
-catalogRouter.get('/products/:id', async (req, res) => {
+catalogRouter.get('/products/:id', async (req: AuthenticatedRequest, res) => {
   try {
     const id = String(req.params.id);
     if (!isUuid(id)) {
@@ -164,7 +174,7 @@ catalogRouter.get('/products/:id', async (req, res) => {
       },
     });
     if (!product) return res.status(404).json({ error: 'Product not found.' });
-    res.json(formatProductForResponse(product));
+    res.json(sanitizeProductForRole(product, req.user?.role));
   } catch (error) {
     return handleRouteError(res, error, 'GET /api/products/:id');
   }

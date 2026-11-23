@@ -185,6 +185,18 @@ describe('Round 2 Security Hardening (SEC-11, SEC-14, SEC-15, SEC-17)', () => {
 
     expect(runGuard(ROLE_GROUPS.CATALOG_WRITE, 'TECHNICIAN').status).toBe(403);
     expect(runGuard(ROLE_GROUPS.CATALOG_WRITE, 'SALES').passed).toBe(true);
+
+    expect(runGuard(ROLE_GROUPS.OFFERS_READ, 'TECHNICIAN').status).toBe(403);
+    expect(runGuard(ROLE_GROUPS.OFFERS_READ, 'ACCOUNTANT').passed).toBe(true);
+    expect(runGuard(ROLE_GROUPS.OFFERS_READ, 'USER').passed).toBe(true);
+
+    expect(runGuard(ROLE_GROUPS.PURCHASE_COST_READ, 'TECHNICIAN').status).toBe(403);
+    expect(runGuard(ROLE_GROUPS.PURCHASE_COST_READ, 'USER').status).toBe(403);
+    expect(runGuard(ROLE_GROUPS.PURCHASE_COST_READ, 'ACCOUNTANT').passed).toBe(true);
+    expect(runGuard(ROLE_GROUPS.PURCHASE_COST_READ, 'SALES').passed).toBe(true);
+
+    expect(runGuard(ROLE_GROUPS.CUSTOMER_WRITE, 'TECHNICIAN').status).toBe(403);
+    expect(runGuard(ROLE_GROUPS.CUSTOMER_WRITE, 'ACCOUNTANT').passed).toBe(true);
   });
 
   it('revokes JWTs on tokenVersion mismatch and enforces mustChangePassword server-side (SEC-14)', async () => {

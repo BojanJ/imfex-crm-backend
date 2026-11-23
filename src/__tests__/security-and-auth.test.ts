@@ -296,6 +296,7 @@ describe('Round 2 Security Hardening (SEC-11, SEC-14, SEC-15, SEC-17)', () => {
         });
 
       expect(await checkOrigin('https://imfex-crm-frontend.vercel.app')).toBe(true);
+      expect(await checkOrigin('https://imfex-crm-frontend-4yu1.vercel.app')).toBe(true);
       expect(await checkOrigin('http://localhost:3000')).toBe(false);
       expect(await checkOrigin('https://imfex-crm-frontend-attacker.vercel.app')).toBe(false);
     } finally {

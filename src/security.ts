@@ -113,6 +113,7 @@ export function buildCorsOptions(): CorsOptions {
   const staticAllowed = new Set<string>([
     ...devOrigins,
     'https://imfex-crm-frontend.vercel.app',
+    'https://imfex-crm-frontend-4yu1.vercel.app',
     ...envOrigins,
   ]);
 
